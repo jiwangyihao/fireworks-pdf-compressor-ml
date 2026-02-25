@@ -1316,7 +1316,20 @@ class PipelinedMLProcessor:
                     # Only process full batches unless we're flushing
                     is_flushing = getattr(self, '_slbr_stream_done', False) and \
                                   not esrgan_queue and not nafdpm_enqueue_queue
-                    if not self._nafdpm.has_full_batch() and not is_flushing:
+
+                    # Deadlock break condition:
+                    # ESRGAN may pause when lead gap reaches LEAD_PAGES.
+                    # If NAF-DPM is waiting for a full batch at this moment,
+                    # both stages can stall with no progress.
+                    # In that case, allow partial-batch processing to advance NAF-DPM
+                    # and reopen ESRGAN scheduling.
+                    esrgan_blocked_by_lead = (
+                        len(esrgan_queue) > 0 and
+                        (esrgan_completed - nafdpm_pages_completed) >= LEAD_PAGES
+                    )
+                    allow_partial_batch = is_flushing or esrgan_blocked_by_lead
+
+                    if not self._nafdpm.has_full_batch() and not allow_partial_batch:
                         break
 
                     if self._progress:
