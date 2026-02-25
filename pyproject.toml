@@ -1,0 +1,26 @@
+[project]
+name = "fireworks-pdf-compressor-ml"
+version = "0.1.0"
+description = "PDF compression with optional ML enhancement pipeline"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MPL-2.0"
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "pillow",
+  "tqdm",
+  "pikepdf",
+  "pymupdf",
+  "imagecodecs",
+  "doxapy",
+  "onnxruntime-directml",
+  "pyinstaller",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = false

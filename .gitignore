@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.venv/
+
+# Build outputs
+build/
+dist/
+*.spec.bak
+*.pkg
+
+# Temp / test artifacts
+*.tmp_gs
+overlap_timeseries.csv
+
+
+# OS
+Thumbs.db
+.DS_Store

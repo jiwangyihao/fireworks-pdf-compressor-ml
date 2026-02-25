@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Build EXE
+        run: uv run pyinstaller --noconfirm compress.spec
+
+      - name: Create SHA256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/FireworksPDFCompressor.exe" -Algorithm SHA256).Hash
+          Set-Content -Path "dist/FireworksPDFCompressor.exe.sha256" -Value $hash
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Prebuilt Package
+            This release provides a prebuilt Windows executable.
+
+            ## Compliance Notes
+            - This project repository is licensed under MPL-2.0.
+            - This release currently bundles `gs/` (Ghostscript runtime).
+            - Please review Ghostscript AGPL/commercial licensing obligations for your redistribution scenario.
+            - Please verify redistribution terms for included ML model files before further distribution.
+
+            Source code is available in this repository as required for open-source compliance workflows.
+          files: |
+            dist/FireworksPDFCompressor.exe
+            dist/FireworksPDFCompressor.exe.sha256
