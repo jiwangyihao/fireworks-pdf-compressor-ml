@@ -53,9 +53,48 @@ jobs:
 
           if ($prevTag -and $prevTag.Trim() -ne "") {
             $changelogUrl = "https://github.com/$repo/compare/$prevTag...$tag"
+            $subjects = git log "$prevTag..$tag" --pretty=format:"%s"
           } else {
             $changelogUrl = "https://github.com/$repo/commits/$tag"
+            $subjects = git log -n 20 --pretty=format:"%s" "$tag"
           }
+
+          $groups = @{
+            feat = New-Object System.Collections.Generic.List[string]
+            fix = New-Object System.Collections.Generic.List[string]
+            perf = New-Object System.Collections.Generic.List[string]
+            chore = New-Object System.Collections.Generic.List[string]
+            other = New-Object System.Collections.Generic.List[string]
+          }
+
+          foreach ($s in $subjects) {
+            if (-not $s) { continue }
+            $line = $s.Trim()
+            if ($line -match '^(?i)feat(\(|:|\s)') {
+              $groups.feat.Add($line)
+            } elseif ($line -match '^(?i)fix(\(|:|\s)') {
+              $groups.fix.Add($line)
+            } elseif ($line -match '^(?i)perf(\(|:|\s)') {
+              $groups.perf.Add($line)
+            } elseif ($line -match '^(?i)chore(\(|:|\s)') {
+              $groups.chore.Add($line)
+            } else {
+              $groups.other.Add($line)
+            }
+          }
+
+          function Convert-ToBullets([System.Collections.Generic.List[string]]$items, [string]$emptyText) {
+            if ($items.Count -eq 0) {
+              return "- $emptyText"
+            }
+            return (($items | ForEach-Object { "- $_" }) -join "`n")
+          }
+
+          $featMd = Convert-ToBullets $groups.feat "无"
+          $fixMd = Convert-ToBullets $groups.fix "无"
+          $perfMd = Convert-ToBullets $groups.perf "无"
+          $choreMd = Convert-ToBullets $groups.chore "无"
+          $otherMd = Convert-ToBullets $groups.other "无"
 
           @"
           ## Fireworks PDF Compressor ML $tag
@@ -67,6 +106,22 @@ jobs:
           - PDF 压缩流水线（无损优先 + 有损交错）
           - 可选 ML 图像处理链路（去水印 / 增强 / 去噪 / 文档优化）
           - 预构建 Windows 可执行文件（EXE）与 SHA256 校验文件
+
+          #### 变更摘要（按类型）
+          ##### Feat
+          $featMd
+
+          ##### Fix
+          $fixMd
+
+          ##### Perf
+          $perfMd
+
+          ##### Chore
+          $choreMd
+
+          ##### Other
+          $otherMd
 
           #### 合规说明
           - 仓库许可证：MPL-2.0
@@ -82,6 +137,22 @@ jobs:
           - PDF compression pipeline (lossless-first + interleaved lossy)
           - Optional ML image pipeline (watermark handling / enhancement / denoising / document optimization)
           - Prebuilt Windows executable (EXE) and SHA256 checksum file
+
+          #### Change Summary (by commit type)
+          ##### Feat
+          $featMd
+
+          ##### Fix
+          $fixMd
+
+          ##### Perf
+          $perfMd
+
+          ##### Chore
+          $choreMd
+
+          ##### Other
+          $otherMd
 
           #### Compliance
           - Repository license: MPL-2.0
