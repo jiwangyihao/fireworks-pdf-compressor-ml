@@ -37,21 +37,67 @@ jobs:
           $hash = (Get-FileHash "dist/FireworksPDFCompressor.exe" -Algorithm SHA256).Hash
           Set-Content -Path "dist/FireworksPDFCompressor.exe.sha256" -Value $hash
 
+      - name: Generate Release Notes
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $repo = "${{ github.repository }}"
+
+          # Try to find previous tag for compare link (fallback to commits view)
+          $prevTag = ""
+          try {
+            $prevTag = (git tag --sort=-v:refname | Where-Object { $_ -ne $tag } | Select-Object -First 1)
+          } catch {
+            $prevTag = ""
+          }
+
+          if ($prevTag -and $prevTag.Trim() -ne "") {
+            $changelogUrl = "https://github.com/$repo/compare/$prevTag...$tag"
+          } else {
+            $changelogUrl = "https://github.com/$repo/commits/$tag"
+          }
+
+          @"
+          ## Fireworks PDF Compressor ML $tag
+
+          ### 中文
+          本版本提供面向 GitHub 托管场景的 PDF 优化能力更新，并附带可直接下载的 Windows 预构建包。
+
+          #### 发布内容
+          - PDF 压缩流水线（无损优先 + 有损交错）
+          - 可选 ML 图像处理链路（去水印 / 增强 / 去噪 / 文档优化）
+          - 预构建 Windows 可执行文件（EXE）与 SHA256 校验文件
+
+          #### 合规说明
+          - 仓库许可证：MPL-2.0
+          - 发布包包含 `gs/`（Ghostscript 运行时）
+          - 模型文件可能存在独立许可条款，二次分发前请确认
+
+          ---
+
+          ### English
+          This release includes updates for GitHub-oriented PDF optimization workflows, with ready-to-use Windows prebuilt artifacts.
+
+          #### Included
+          - PDF compression pipeline (lossless-first + interleaved lossy)
+          - Optional ML image pipeline (watermark handling / enhancement / denoising / document optimization)
+          - Prebuilt Windows executable (EXE) and SHA256 checksum file
+
+          #### Compliance
+          - Repository license: MPL-2.0
+          - Release package bundles `gs/` (Ghostscript runtime)
+          - Model files may have separate redistribution terms
+
+          ---
+
+          **Full Changelog**: $changelogUrl
+          "@ | Set-Content -Path "RELEASE_NOTES.md" -Encoding UTF8
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
-          body: |
-            ## Prebuilt Package
-            This release provides a prebuilt Windows executable.
-
-            ## Compliance Notes
-            - This project repository is licensed under MPL-2.0.
-            - This release currently bundles `gs/` (Ghostscript runtime).
-            - Please review Ghostscript AGPL/commercial licensing obligations for your redistribution scenario.
-            - Please verify redistribution terms for included ML model files before further distribution.
-
-            Source code is available in this repository as required for open-source compliance workflows.
+          generate_release_notes: false
+          body_path: RELEASE_NOTES.md
           files: |
             dist/FireworksPDFCompressor.exe
             dist/FireworksPDFCompressor.exe.sha256
