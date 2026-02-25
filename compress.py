@@ -1481,10 +1481,21 @@ def process_page_chunk_tiling(input_path, start_page, end_page, chunk_id, target
                 continue  # 彩色图跳过
 
             mode = detect_mono_or_hybrid(pil_img)[0]
+            # 基于当前 xref 的覆盖率，避免小面积承载层触发整页重写
+            coverage_ratio = (sum(r.get_area() for r in rects) / page.rect.get_area()) if rects else 0.0
 
             # 2. 灰度图处理策略
             # 此时已确定页面无干扰元素，可以安全地重构页面
             if mode == "MONO":
+                # 防护1：仅处理覆盖率较高的 MONO 图层，避免小面积图层误触发整页 clean_contents
+                if coverage_ratio < 0.5:
+                    continue
+
+                # 防护2：跳过“纯黑承载层”（常见于带 alpha/叠层的资源页），避免输出整页黑屏
+                gray_arr = np.asarray(pil_img.convert("L"), dtype=np.uint8)
+                if int(gray_arr.max()) == 0:
+                    continue
+
                 # 全单色 -> 直接二值化重构 (不区分大小，只要是纯图页面的 Mono 均处理)
                 # type: ignore
                 img_bin = pil_img.convert("L").point(
@@ -1631,6 +1642,7 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
 # ============================
 def process_file(input_path, idx, total):
     file_mb = get_file_mb(input_path)
+    initially_under_threshold = file_mb < SIZE_THRESHOLD_MB
     base_name = os.path.basename(input_path)
     safe_print(f"\n[{idx}/{total}] Processing: {base_name} ({file_mb:.2f} MB)")
 
@@ -1645,7 +1657,7 @@ def process_file(input_path, idx, total):
     # --- Phase 1: Safe Phase ---
     safe_print("      [Phase 1] 安全模式 (清理 + GS + 无损)...")
 
-    if file_mb < SIZE_THRESHOLD_MB:
+    if initially_under_threshold:
         safe_print("      [OK] 源文件已较小 (<100MB)，仅运行安全模式。")
 
     if surgical_clean(input_path, tmp_clean):
@@ -1705,6 +1717,29 @@ def process_file(input_path, idx, total):
 
     safe_mb = get_file_mb(current_file)
     safe_print(f"      [DOWN] 安全模式结果: {safe_mb:.2f} MB")
+
+    # 规则：如果源文件一开始就小于阈值，安全阶段结束后必须直接返回，不进入后续有损流程。
+    if initially_under_threshold:
+        safe_print("      [OK] 原始文件已低于阈值，安全阶段后直接结束。")
+        if safe_mb < file_mb:
+            try:
+                shutil.move(current_file, input_path)
+                safe_print(
+                    f"      [SAVE] 覆盖原文件: {os.path.basename(input_path)} ({safe_mb:.2f} MB)"
+                )
+            except:
+                pass
+        else:
+            safe_print("      [SKIP] 安全模式无收益。")
+            if current_file != input_path:
+                safe_remove(current_file)
+
+        # Cleanup temps
+        safe_remove(tmp_clean)
+        safe_remove(tmp_gs)
+        safe_remove(tmp_img0)
+        safe_remove(tmp_gray)
+        return
 
     if safe_mb < SIZE_THRESHOLD_MB:
         safe_print("      [OK] 安全优化已达目标大小，跳过有损阶段。")
