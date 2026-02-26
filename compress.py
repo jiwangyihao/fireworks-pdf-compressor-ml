@@ -1569,6 +1569,17 @@ def process_page_chunk_tiling(input_path, start_page, end_page, chunk_id, target
         page_modified = False
         for img_info in list(img_list):
             xref = img_info[0]
+
+            # 关键修复：带 SMask/Mask 的图层常是透明叠层资源，
+            # 对其做二值化可能导致整页被重写为近全黑图（第34页黑屏问题）。
+            # fitz get_images(full=True) 返回 tuple，第2项通常为 smask xref（0 表示无）。
+            try:
+                smask_xref = int(img_info[1]) if len(img_info) > 1 else 0
+            except:
+                smask_xref = 0
+            if smask_xref > 0:
+                continue
+
             rects = page.get_image_rects(xref)
             if not rects:
                 continue
