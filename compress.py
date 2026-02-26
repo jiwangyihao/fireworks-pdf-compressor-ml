@@ -117,6 +117,115 @@ def get_file_mb(path):
     return os.path.getsize(path) / (1024 * 1024)
 
 
+def _build_image_size_map(pdf_path):
+    """构建 xref -> 图像流原始大小映射。"""
+    size_map = {}
+    try:
+        with pikepdf.open(pdf_path) as pdf:
+            for i, obj in enumerate(pdf.objects):
+                if isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == "/Image":
+                    try:
+                        size_map[i] = len(obj.read_raw_bytes())
+                    except:
+                        pass
+    except:
+        pass
+    return size_map
+
+
+def _estimate_page_image_payloads(pdf_path):
+    """按页估算图像载荷（每页按唯一 xref 计一次）。"""
+    payloads = []
+    try:
+        size_map = _build_image_size_map(pdf_path)
+        doc = fitz.open(pdf_path)
+        for i in range(len(doc)):
+            xrefs = sorted(set(im[0] for im in doc[i].get_images(full=True)))
+            payloads.append(sum(size_map.get(x, 0) for x in xrefs))
+        doc.close()
+    except:
+        return []
+    return payloads
+
+
+def rollback_worse_pages_by_image_payload(prev_pdf, cand_pdf, out_pdf, tolerance_bytes=0, max_rounds=3):
+    """将候选文件中“图像载荷变大”的页面回退为上一阶段页面（迭代收敛版）。
+
+    说明：
+    - 只以 prev_pdf 为唯一基准，不做相对原始输入页回退。
+    - 因页面替换会改变资源引用关系，单轮回退后可能仍有残留放大页，
+      这里迭代最多 max_rounds 轮，直到无放大页或达到上限。
+
+    返回: (ok, total_rolled_back_pages)
+    """
+    try:
+        prev_payloads = _estimate_page_image_payloads(prev_pdf)
+        cand_payloads = _estimate_page_image_payloads(cand_pdf)
+        if not prev_payloads or not cand_payloads:
+            return False, 0
+        if len(prev_payloads) != len(cand_payloads):
+            return False, 0
+
+        current_input = cand_pdf
+        temp_outputs = []
+        total_flagged = set()
+
+        for round_idx in range(max(1, max_rounds)):
+            cur_payloads = _estimate_page_image_payloads(current_input)
+            if not cur_payloads or len(cur_payloads) != len(prev_payloads):
+                break
+
+            worse_pages = [
+                idx for idx, (p0, p1) in enumerate(zip(prev_payloads, cur_payloads))
+                if p1 > p0 + tolerance_bytes
+            ]
+            if not worse_pages:
+                break
+
+            for idx in worse_pages:
+                total_flagged.add(idx)
+
+            round_out = f"{out_pdf}.r{round_idx}"
+            temp_outputs.append(round_out)
+
+            cand_doc = fitz.open(current_input)
+            prev_doc = fitz.open(prev_pdf)
+            # 倒序替换，避免页码漂移
+            for idx in sorted(worse_pages, reverse=True):
+                cand_doc.delete_page(idx)
+                cand_doc.insert_pdf(prev_doc, from_page=idx, to_page=idx, start_at=idx)
+            cand_doc.save(round_out, garbage=4, deflate=True)
+            cand_doc.close()
+            prev_doc.close()
+
+            current_input = round_out
+
+        final_payloads = _estimate_page_image_payloads(current_input)
+        if final_payloads and len(final_payloads) == len(prev_payloads):
+            remain_worse = [
+                idx for idx, (p0, p1) in enumerate(zip(prev_payloads, final_payloads))
+                if p1 > p0 + tolerance_bytes
+            ]
+            for idx in remain_worse:
+                total_flagged.add(idx)
+
+        if not total_flagged:
+            for t in temp_outputs:
+                safe_remove(t)
+            return False, 0
+
+        if current_input != out_pdf:
+            shutil.copy2(current_input, out_pdf)
+
+        for t in temp_outputs:
+            if t != out_pdf:
+                safe_remove(t)
+
+        return is_valid_pdf(out_pdf), len(total_flagged)
+    except:
+        return False, 0
+
+
 def is_valid_pdf(path):
     if not os.path.exists(path):
         return False
@@ -938,15 +1047,23 @@ def format_number(bytes_val, sig_figs):
         if len(bytes_val) < 3:
             return bytes_val
         val = float(bytes_val)
-        new_str = (
-            "{:.0f}".format(val)
-            if val.is_integer()
-            else "{:.{p}g}".format(val, p=sig_figs)
-        )
+        # 关键修复：PDF 数值语法不接受科学计数法（如 2e+04）。
+        # 这里强制使用十进制定点表示，再去掉末尾无效 0。
+        if val.is_integer():
+            new_str = "{:.0f}".format(val)
+        else:
+            # sig_figs 作为小数位上限使用，避免输出指数形式
+            new_str = f"{val:.{sig_figs}f}".rstrip("0").rstrip(".")
+            # 兜底：若被格式化为空，回退为 0
+            if not new_str:
+                new_str = "0"
+
         if new_str.startswith("0."):
             new_str = new_str[1:]
         elif new_str.startswith("-0."):
             new_str = "-" + new_str[2:]
+        elif new_str == "-0":
+            new_str = "0"
         new_bytes = new_str.encode("ascii")
         if len(new_bytes) < len(bytes_val):
             return new_bytes
@@ -1675,6 +1792,7 @@ def process_file(input_path, idx, total):
     # === 修复逻辑：尝试运行 GS，但如果结果损坏或文字乱码，自动回退 ===
     gs_success = run_gs_level0(current_file, tmp_gs, total_pages)
     if gs_success:
+        prev_mb_before_gs = get_file_mb(current_file)
         # 验证 GS 结果是否损坏 (MuPDF check)
         try:
             # 结构完整性 + 文字完整性检查 (合并打开两个PDF，减少I/O开销)
@@ -1697,9 +1815,29 @@ def process_file(input_path, idx, total):
                     keep_gs = False
             
             if keep_gs:
-                if current_file != input_path:
-                    safe_remove(current_file)
-                current_file = tmp_gs
+                # GS 页面级回退：先回退“相对上一阶段变大”的页面，再决定是否采用
+                gs_candidate = tmp_gs
+                gs_guard_file = tmp_gs + ".tmp_guard_prev"
+                gs_guard_ok, gs_worse_cnt = rollback_worse_pages_by_image_payload(
+                    current_file, tmp_gs, gs_guard_file
+                )
+                if gs_guard_ok and is_valid_pdf(gs_guard_file):
+                    gs_candidate = gs_guard_file
+                    safe_print(f"      [GUARD] GS 页级回退(迭代): 回退 {gs_worse_cnt} 页")
+
+                # 严格相对上一阶段回退：页面回退后仍不变小则不采用
+                gs_mb = get_file_mb(gs_candidate)
+                if gs_mb > 0.01 and gs_mb < prev_mb_before_gs:
+                    if current_file != input_path:
+                        safe_remove(current_file)
+                    current_file = gs_candidate
+                    safe_print(f"      [DOWN] GS 重构收益: {gs_mb:.2f} MB")
+                    if gs_candidate != tmp_gs:
+                        safe_remove(tmp_gs)
+                else:
+                    safe_print("      [SKIP] GS 无收益，回退上一阶段。")
+                    safe_remove(tmp_gs)
+                    safe_remove(gs_guard_file)
             else:
                 safe_remove(tmp_gs)
 
@@ -1894,15 +2032,32 @@ def process_file(input_path, idx, total):
             success = run_tiling_pass(lossy_working_file, next_file, args[0], desc)
 
         if success:
-            new_mb = get_file_mb(next_file)
+            candidate_file = next_file
+
+            # 页级回退守卫：相对“上一阶段”回退（严格迭代）
+            if stype in ["I", "T"]:
+                guard_file_prev = next_file + ".tmp_guard_prev"
+                guard_ok_prev, worse_cnt_prev = rollback_worse_pages_by_image_payload(
+                    lossy_working_file, next_file, guard_file_prev
+                )
+                if guard_ok_prev and is_valid_pdf(guard_file_prev):
+                    candidate_file = guard_file_prev
+                    safe_print(f"      [GUARD] 上一阶段回退(迭代): 回退 {worse_cnt_prev} 页")
+
+            new_mb = get_file_mb(candidate_file)
             if new_mb > 0.01 and new_mb < get_file_mb(lossy_working_file):
                 safe_print(f"      [DOWN] 成功: {new_mb:.2f} MB")
                 if lossy_working_file != input_path:
                     safe_remove(lossy_working_file)
-                lossy_working_file = next_file
+                lossy_working_file = candidate_file
+                # next_file 不是最终采用文件时清理之
+                if candidate_file != next_file:
+                    safe_remove(next_file)
             else:
                 safe_print("      [SKIP] 无收益")
                 safe_remove(next_file)
+                # guard 文件若存在也清理
+                safe_remove(next_file + ".tmp_guard_prev")
         else:
             safe_print("      [SKIP] 已跳过")
 
