@@ -6,6 +6,7 @@ import math
 import shutil
 import subprocess
 import multiprocessing
+import threading
 import zlib  # Added for Flate compression
 from pathlib import Path
 
@@ -63,7 +64,7 @@ except AttributeError:
 # 基础配置
 SIZE_THRESHOLD_MB = 100
 MIN_IMAGE_SIZE = 2048
-CHUNK_SIZE = 100
+CHUNK_SIZE = 20
 CURVE_SIMPLIFY_THRESHOLD = 0.5
 CPU_CORES = max(1, multiprocessing.cpu_count() - 1)
 
@@ -1040,6 +1041,12 @@ VY_PATTERN = re.compile(
 M_PATTERN = re.compile(rb"(" + NUM_RE + rb")(\s+)(" + NUM_RE + rb")(\s+)(m)(?=\s|$)")
 W_PATTERN = re.compile(rb"(" + NUM_RE + rb")(\s+)(w)(?=\s|$)")
 
+# 矢量流分块阈值与块大小（偏向“进度平滑”）
+# - 超过 1MB 即进入分块处理
+# - 每块约 256KB，提升进度条刷新频率
+VECTOR_SPLIT_THRESHOLD_BYTES = 1 * 1024 * 1024
+VECTOR_CHUNK_TARGET_BYTES = 256 * 1024
+
 
 def format_number(bytes_val, sig_figs):
     try:
@@ -1132,7 +1139,90 @@ def replace_c_smart(m, sig_figs):
     return replace_c_v4(m, sig_figs)
 
 
-def process_regex_chunk(file_path, xref_list, sig_figs, enable_smart_c):
+def _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c):
+    """对一段内容流执行既有矢量正则优化。"""
+    d = L_PATTERN.sub(lambda m: replace_2args(m, sig_figs), raw_data)
+    d = VY_PATTERN.sub(lambda m: replace_vy(m, sig_figs), d)
+    d = M_PATTERN.sub(lambda m: replace_2args(m, sig_figs), d)
+    d = W_PATTERN.sub(lambda m: replace_w(m, sig_figs), d)
+    if enable_smart_c:
+        d = C_PATTERN.sub(lambda m: replace_c_smart(m, sig_figs), d)
+    else:
+        d = C_PATTERN.sub(lambda m: replace_c_v4(m, sig_figs), d)
+    return d
+
+
+def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progress_callback=None):
+    """超大流分块优化：按行聚合成约 1MB 子块，逐块处理并拼回。"""
+    if len(raw_data) <= VECTOR_SPLIT_THRESHOLD_BYTES:
+        out = _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c)
+        if progress_callback:
+            progress_callback(len(raw_data))
+        return out
+
+    lines = raw_data.splitlines(keepends=True)
+    # 若几乎没有换行，按空白边界切块（避免错误切断 token）
+    if len(lines) <= 1:
+        chunks = []
+        n = len(raw_data)
+        pos = 0
+        while pos < n:
+            end = min(pos + VECTOR_CHUNK_TARGET_BYTES, n)
+            if end < n:
+                split = end
+                while split > pos and raw_data[split - 1] not in b" \t\r\n":
+                    split -= 1
+                if split == pos:
+                    split = end
+                end = split
+            chunks.append(raw_data[pos:end])
+            pos = end
+
+        out_parts = [b""] * len(chunks)
+        max_workers = min(max(2, CPU_CORES // 2), len(chunks), 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(_apply_vector_regex_passes, ch, sig_figs, enable_smart_c): idx
+                for idx, ch in enumerate(chunks)
+            }
+            for f in as_completed(futures):
+                idx = futures[f]
+                out_parts[idx] = f.result()
+                if progress_callback:
+                    progress_callback(len(chunks[idx]))
+        return b"".join(out_parts)
+
+    chunks = []
+    buf = []
+    buf_size = 0
+    for ln in lines:
+        if buf_size + len(ln) > VECTOR_CHUNK_TARGET_BYTES and buf:
+            chunks.append(b"".join(buf))
+            buf = [ln]
+            buf_size = len(ln)
+        else:
+            buf.append(ln)
+            buf_size += len(ln)
+    if buf:
+        chunks.append(b"".join(buf))
+
+    out_parts = [b""] * len(chunks)
+    max_workers = min(max(2, CPU_CORES // 2), len(chunks), 8)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {
+            ex.submit(_apply_vector_regex_passes, ch, sig_figs, enable_smart_c): idx
+            for idx, ch in enumerate(chunks)
+        }
+        for f in as_completed(futures):
+            idx = futures[f]
+            out_parts[idx] = f.result()
+            if progress_callback:
+                progress_callback(len(chunks[idx]))
+
+    return b"".join(out_parts)
+
+
+def process_regex_chunk(file_path, xref_list, sig_figs, enable_smart_c, progress_callback=None):
     results = {}
     inline_img_re = re.compile(rb"(^|\s)BI(\s|$)")
     try:
@@ -1147,16 +1237,13 @@ def process_regex_chunk(file_path, xref_list, sig_figs, enable_smart_c):
                         continue
                     raw_data = stream_obj.read_bytes()
                     if inline_img_re.search(raw_data):
+                        if progress_callback:
+                            progress_callback(len(raw_data))
                         continue
 
-                    d = L_PATTERN.sub(lambda m: replace_2args(m, sig_figs), raw_data)
-                    d = VY_PATTERN.sub(lambda m: replace_vy(m, sig_figs), d)
-                    d = M_PATTERN.sub(lambda m: replace_2args(m, sig_figs), d)
-                    d = W_PATTERN.sub(lambda m: replace_w(m, sig_figs), d)
-                    if enable_smart_c:
-                        d = C_PATTERN.sub(lambda m: replace_c_smart(m, sig_figs), d)
-                    else:
-                        d = C_PATTERN.sub(lambda m: replace_c_v4(m, sig_figs), d)
+                    d = _split_and_optimize_large_stream(
+                        raw_data, sig_figs, enable_smart_c, progress_callback=progress_callback
+                    )
 
                     if len(d) < len(raw_data):
                         results[xref] = d
@@ -1169,34 +1256,74 @@ def process_regex_chunk(file_path, xref_list, sig_figs, enable_smart_c):
 
 def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
     try:
-        candidate_xrefs = []
+        candidate_with_size = []
         with pikepdf.open(input_path) as pdf:
             for i, obj in enumerate(pdf.objects):
                 if isinstance(obj, pikepdf.Stream):
                     subtype = str(obj.get("/Subtype") or "")
                     if "/Image" not in subtype and "/Font" not in subtype:
-                        candidate_xrefs.append(i)
+                        # 用“解码后真实流长度”统计进度总量，避免 /Length(压缩长度) 失真
+                        try:
+                            stream_len = len(obj.read_bytes())
+                        except:
+                            try:
+                                stream_len = int(obj.get("/Length") or 0)
+                            except:
+                                stream_len = 0
+                        candidate_with_size.append((i, stream_len))
 
-        chunks = [
-            candidate_xrefs[i : i + CHUNK_SIZE]
-            for i in range(0, len(candidate_xrefs), CHUNK_SIZE)
-        ]
+        candidate_with_size.sort(key=lambda x: x[1])
+        candidate_xrefs = [x[0] for x in candidate_with_size]
+        size_map = {x[0]: max(int(x[1]), 1) for x in candidate_with_size}
+        total_bytes = sum(size_map.values())
+
+        if not candidate_xrefs:
+            return False
+
         all_results = {}
+        done_streams = 0
+        done_bytes = [0]
+        pbar_lock = threading.Lock()
         with ThreadPoolExecutor() as executor:
+            pbar = tqdm(
+                total=max(total_bytes, 1),
+                desc=f"      🔥 {desc}",
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            )
+
+            def on_bytes_done(nbytes):
+                with pbar_lock:
+                    remaining = max(total_bytes - done_bytes[0], 0)
+                    inc = min(max(int(nbytes), 0), remaining)
+                    if inc > 0:
+                        pbar.update(inc)
+                        done_bytes[0] += inc
+
             futures = {
                 executor.submit(
-                    process_regex_chunk, input_path, chunk, sig_figs, enable_smart_c
-                ): chunk
-                for chunk in chunks
+                    process_regex_chunk,
+                    input_path,
+                    [xref],
+                    sig_figs,
+                    enable_smart_c,
+                    on_bytes_done,
+                ): xref
+                for xref in candidate_xrefs
             }
-            for f in tqdm(
-                as_completed(futures),
-                total=len(chunks),
-                desc=f"      🔥 {desc}",
-                unit="chunk",
-            ):
+            for f in as_completed(futures):
+                xref = futures[f]
+                done_streams += 1
+                pbar.set_postfix(streams=f"{done_streams}/{len(candidate_xrefs)}")
+
                 if res := f.result():
                     all_results.update(res)
+
+            # 兜底补齐进度条（避免估算误差导致未满）
+            if done_bytes[0] < total_bytes:
+                pbar.update(total_bytes - done_bytes[0])
+            pbar.close()
 
         if not all_results:
             return False
