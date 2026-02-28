@@ -271,6 +271,231 @@ def rollback_worse_pages_by_image_payload(prev_pdf, cand_pdf, out_pdf, tolerance
         return False, 0
 
 
+def _get_page_content_stream_pairs(page_obj):
+    """提取页面 /Contents 中的流对象序列。
+
+    返回: [(slot, stream_obj), ...]
+    - slot: "/Contents" (单流) 或数组下标 (多流)
+    """
+    pairs = []
+    try:
+        contents = page_obj.get("/Contents", None)
+        if isinstance(contents, pikepdf.Stream):
+            pairs.append(("/Contents", contents))
+        elif isinstance(contents, pikepdf.Array):
+            for idx, item in enumerate(contents):
+                if isinstance(item, pikepdf.Stream):
+                    pairs.append((idx, item))
+    except:
+        return []
+    return pairs
+
+
+_GS_REF_RE = re.compile(rb"/([^\s/<>\[\]\(\)%]+)\s+gs(?=\s|$)")
+
+
+def _extract_gs_refs_from_stream(stream_obj):
+    """提取内容流中使用的 gs 资源名集合（不含前导 /）。"""
+    try:
+        data = stream_obj.read_bytes()
+        return set(m.decode("latin1", "ignore") for m in _GS_REF_RE.findall(data))
+    except:
+        return set()
+
+
+def _get_page_extgstate_keys(page_obj):
+    """提取页面 /Resources /ExtGState 的键名集合（不含前导 /）。"""
+    keys = set()
+    try:
+        res = page_obj.get("/Resources", None)
+        if isinstance(res, pikepdf.Dictionary):
+            ext = res.get("/ExtGState", None)
+            if isinstance(ext, pikepdf.Dictionary):
+                for k in ext.keys():
+                    keys.add(str(k).lstrip("/"))
+    except:
+        return set()
+    return keys
+
+
+def _get_page_resources_dict(page_obj):
+    """获取页面资源字典，支持沿 /Parent 链继承查找。"""
+    try:
+        node = page_obj
+        hops = 0
+        while node is not None and hops < 32:
+            res = node.get("/Resources", None)
+            if isinstance(res, pikepdf.Dictionary):
+                return res
+            node = node.get("/Parent", None)
+            hops += 1
+    except:
+        return None
+    return None
+
+
+def _get_page_extgstate_dict(page_obj):
+    """获取页面 ExtGState 资源字典，不存在则返回 None。"""
+    try:
+        res = _get_page_resources_dict(page_obj)
+        if isinstance(res, pikepdf.Dictionary):
+            ext = res.get("/ExtGState", None)
+            if isinstance(ext, pikepdf.Dictionary):
+                return ext
+    except:
+        return None
+    return None
+
+
+def _ensure_page_own_extgstate_dict(page_obj):
+    """确保页面拥有可写的 /Resources /ExtGState（避免改到继承字典）。"""
+    try:
+        inherited_res = _get_page_resources_dict(page_obj)
+
+        # 1) 资源字典下沉到当前页
+        if "/Resources" in page_obj and isinstance(page_obj.get("/Resources"), pikepdf.Dictionary):
+            page_res = page_obj.get("/Resources")
+        else:
+            if isinstance(inherited_res, pikepdf.Dictionary):
+                page_res = pikepdf.Dictionary(inherited_res)
+            else:
+                page_res = pikepdf.Dictionary()
+            page_obj["/Resources"] = page_res
+
+        # 2) ExtGState 下沉到当前页资源
+        ext = page_res.get("/ExtGState", None)
+        if isinstance(ext, pikepdf.Dictionary):
+            own_ext = pikepdf.Dictionary(ext)
+            page_res["/ExtGState"] = own_ext
+            return own_ext
+
+        own_ext = pikepdf.Dictionary()
+        page_res["/ExtGState"] = own_ext
+        return own_ext
+    except:
+        return None
+
+
+def _inject_prev_extgstate_aliases(prev_page, cand_page, missing_refs, cand_pdf):
+    """把 prev 页面缺失的 ExtGState 名称注入到 cand 页面资源，作为名称映射别名。"""
+    if not missing_refs:
+        return True
+    try:
+        prev_ext = _get_page_extgstate_dict(prev_page)
+        cand_ext = _ensure_page_own_extgstate_dict(cand_page)
+        if not isinstance(prev_ext, pikepdf.Dictionary) or not isinstance(cand_ext, pikepdf.Dictionary):
+            return False
+
+        for r in sorted(missing_refs):
+            key = pikepdf.Name("/" + r)
+            prev_obj = prev_ext.get(key, None)
+            if prev_obj is None:
+                prev_obj = prev_ext.get("/" + r, None)
+            if prev_obj is None:
+                return False
+            cand_ext[key] = cand_pdf.copy_foreign(prev_obj)
+
+        return True
+    except:
+        return False
+
+
+def rollback_worse_content_streams(
+    prev_pdf,
+    cand_pdf,
+    out_pdf,
+    tolerance_bytes=64,
+    safe_resource_check=True,
+):
+    """流级内容回退：仅回退相对上一阶段“明显变大”的内容流。
+
+    设计要点：
+    - 仅比较/回退每页 /Contents 中按顺序对应的流对象，不做页级替换。
+    - 使用 tolerance_bytes 容忍编码抖动（例如 +1B 这类无意义差异）。
+
+        返回: (ok, rolled_stream_count, affected_page_count)
+
+        safe_resource_check:
+        - True: 回退前校验 prev 流中的 `/<name> gs` 引用在 cand 页面的
+            /Resources/ExtGState 中全部可解析；否则跳过该流，避免透明度等图形状态丢失。
+        - False: 不做该校验（不安全模式，仅用于对照实验）。
+    """
+    try:
+        rolled_streams = 0
+        affected_pages = set()
+
+        with pikepdf.open(prev_pdf) as prev, pikepdf.open(cand_pdf) as cand:
+            if len(prev.pages) != len(cand.pages):
+                return False, 0, 0
+
+            for page_idx in range(len(cand.pages)):
+                prev_pairs = _get_page_content_stream_pairs(prev.pages[page_idx])
+                cand_pairs = _get_page_content_stream_pairs(cand.pages[page_idx])
+                if not prev_pairs or not cand_pairs:
+                    continue
+
+                # 仅按共同可映射的流数量比较，避免结构差异导致误替换。
+                compare_n = min(len(prev_pairs), len(cand_pairs))
+                for k in range(compare_n):
+                    _, prev_stream = prev_pairs[k]
+                    cand_slot, cand_stream = cand_pairs[k]
+                    try:
+                        prev_raw_len = len(prev_stream.read_raw_bytes())
+                        cand_raw_len = len(cand_stream.read_raw_bytes())
+                    except:
+                        continue
+
+                    if cand_raw_len > prev_raw_len + tolerance_bytes:
+                        if safe_resource_check:
+                            try:
+                                cand_page = cand.pages[page_idx]
+                                refs = _extract_gs_refs_from_stream(prev_stream)
+                                if refs:
+                                    ext_keys = _get_page_extgstate_keys(cand_page)
+                                    missing_refs = set(refs) - set(ext_keys)
+                                    if missing_refs:
+                                        ok_alias = _inject_prev_extgstate_aliases(
+                                            prev.pages[page_idx], cand_page, missing_refs, cand
+                                        )
+                                        if not ok_alias:
+                                            continue
+
+                                    # 注入别名后再次确认引用可解析
+                                    ext_keys2 = _get_page_extgstate_keys(cand_page)
+                                    if not set(refs).issubset(set(ext_keys2)):
+                                        continue
+                            except:
+                                continue
+                        try:
+                            replaced_stream = cand.copy_foreign(prev_stream)
+                            cand_page = cand.pages[page_idx]
+                            if cand_slot == "/Contents":
+                                cand_page["/Contents"] = replaced_stream
+                            else:
+                                arr = cand_page.get("/Contents", None)
+                                if isinstance(arr, pikepdf.Array) and 0 <= cand_slot < len(arr):
+                                    arr[cand_slot] = replaced_stream
+                                else:
+                                    continue
+                            rolled_streams += 1
+                            affected_pages.add(page_idx)
+                        except:
+                            continue
+
+            if rolled_streams <= 0:
+                return False, 0, 0
+
+            cand.save(
+                out_pdf,
+                compress_streams=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            )
+
+        return is_valid_pdf(out_pdf), rolled_streams, len(affected_pages)
+    except:
+        return False, 0, 0
+
+
 def is_valid_pdf(path):
     if not os.path.exists(path):
         return False
@@ -2032,7 +2257,18 @@ def process_file(input_path, idx, total, unattended_mode=False):
                     gs_candidate = gs_guard_file
                     safe_print(f"      [GUARD] GS 页级回退(迭代): 回退 {gs_worse_cnt} 页")
 
-                # 严格相对上一阶段回退：页面回退后仍不变小则不采用
+                # GS 内容流级回退：容忍轻微编码差异，仅回退“明显变大”的内容流
+                gs_content_guard_file = tmp_gs + ".tmp_guard_content"
+                content_guard_ok, rolled_streams, affected_pages = rollback_worse_content_streams(
+                    current_file, gs_candidate, gs_content_guard_file, tolerance_bytes=64
+                )
+                if content_guard_ok and is_valid_pdf(gs_content_guard_file):
+                    gs_candidate = gs_content_guard_file
+                    safe_print(
+                        f"      [GUARD] GS 流级内容回退: 回退 {rolled_streams} 条流 / {affected_pages} 页"
+                    )
+
+                # 严格相对上一阶段回退：守卫后仍不变小则不采用
                 gs_mb = get_file_mb(gs_candidate)
                 if gs_mb > 0.01 and gs_mb < prev_mb_before_gs:
                     if current_file != input_path:
@@ -2041,10 +2277,15 @@ def process_file(input_path, idx, total, unattended_mode=False):
                     safe_print(f"      [DOWN] GS 重构收益: {gs_mb:.2f} MB")
                     if gs_candidate != tmp_gs:
                         safe_remove(tmp_gs)
+                    if gs_candidate != gs_guard_file:
+                        safe_remove(gs_guard_file)
+                    if gs_candidate != gs_content_guard_file:
+                        safe_remove(gs_content_guard_file)
                 else:
                     safe_print("      [SKIP] GS 无收益，回退上一阶段。")
                     safe_remove(tmp_gs)
                     safe_remove(gs_guard_file)
+                    safe_remove(gs_content_guard_file)
             else:
                 safe_remove(tmp_gs)
 
@@ -2312,6 +2553,8 @@ def process_file(input_path, idx, total, unattended_mode=False):
         safe_remove(input_path + s[3])
     safe_remove(tmp_clean)
     safe_remove(tmp_gs)
+    safe_remove(tmp_gs + ".tmp_guard_prev")
+    safe_remove(tmp_gs + ".tmp_guard_content")
     safe_remove(tmp_img0)
     safe_remove(tmp_gray)
 
