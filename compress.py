@@ -23,6 +23,12 @@ from PIL import Image, ImageFilter, ImageEnhance
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# 单一矢量热点引擎（并发优化专用）
+try:
+    import vector_hotspot_cython_nogil as _vector_engine  # type: ignore
+except Exception:
+    _vector_engine = None
+
 # === ML Pipeline 可用性检查 (不预加载模型) ===
 _ml_pipeline_available = None  # None=未检查, True=可用, False=不可用
 
@@ -1046,6 +1052,8 @@ W_PATTERN = re.compile(rb"(" + NUM_RE + rb")(\s+)(w)(?=\s|$)")
 # - 每块约 256KB，提升进度条刷新频率
 VECTOR_SPLIT_THRESHOLD_BYTES = 1 * 1024 * 1024
 VECTOR_CHUNK_TARGET_BYTES = 256 * 1024
+VECTOR_INNER_WORKERS = max(1, int(os.environ.get("VECTOR_INNER_WORKERS", "1")))
+REGEX_STREAM_WORKERS = max(1, int(os.environ.get("REGEX_STREAM_WORKERS", "4")))
 
 
 def format_number(bytes_val, sig_figs):
@@ -1152,10 +1160,21 @@ def _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c):
     return d
 
 
+def _optimize_vector_stream(raw_data, sig_figs, enable_smart_c):
+    """单引擎执行：失败时回退内置正则实现。"""
+    if _vector_engine is not None and hasattr(_vector_engine, "optimize_stream_scan_nogil"):
+        try:
+            return _vector_engine.optimize_stream_scan_nogil(raw_data, sig_figs, False, 16)
+        except Exception:
+            pass
+
+    return _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c)
+
+
 def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progress_callback=None):
     """超大流分块优化：按行聚合成约 1MB 子块，逐块处理并拼回。"""
     if len(raw_data) <= VECTOR_SPLIT_THRESHOLD_BYTES:
-        out = _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c)
+        out = _optimize_vector_stream(raw_data, sig_figs, enable_smart_c)
         if progress_callback:
             progress_callback(len(raw_data))
         return out
@@ -1179,17 +1198,23 @@ def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progres
             pos = end
 
         out_parts = [b""] * len(chunks)
-        max_workers = min(max(2, CPU_CORES // 2), len(chunks), 8)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = {
-                ex.submit(_apply_vector_regex_passes, ch, sig_figs, enable_smart_c): idx
-                for idx, ch in enumerate(chunks)
-            }
-            for f in as_completed(futures):
-                idx = futures[f]
-                out_parts[idx] = f.result()
+        max_workers = min(VECTOR_INNER_WORKERS, len(chunks))
+        if max_workers <= 1:
+            for idx, ch in enumerate(chunks):
+                out_parts[idx] = _optimize_vector_stream(ch, sig_figs, enable_smart_c)
                 if progress_callback:
                     progress_callback(len(chunks[idx]))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {
+                    ex.submit(_optimize_vector_stream, ch, sig_figs, enable_smart_c): idx
+                    for idx, ch in enumerate(chunks)
+                }
+                for f in as_completed(futures):
+                    idx = futures[f]
+                    out_parts[idx] = f.result()
+                    if progress_callback:
+                        progress_callback(len(chunks[idx]))
         return b"".join(out_parts)
 
     chunks = []
@@ -1207,17 +1232,23 @@ def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progres
         chunks.append(b"".join(buf))
 
     out_parts = [b""] * len(chunks)
-    max_workers = min(max(2, CPU_CORES // 2), len(chunks), 8)
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(_apply_vector_regex_passes, ch, sig_figs, enable_smart_c): idx
-            for idx, ch in enumerate(chunks)
-        }
-        for f in as_completed(futures):
-            idx = futures[f]
-            out_parts[idx] = f.result()
+    max_workers = min(VECTOR_INNER_WORKERS, len(chunks))
+    if max_workers <= 1:
+        for idx, ch in enumerate(chunks):
+            out_parts[idx] = _optimize_vector_stream(ch, sig_figs, enable_smart_c)
             if progress_callback:
                 progress_callback(len(chunks[idx]))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(_optimize_vector_stream, ch, sig_figs, enable_smart_c): idx
+                for idx, ch in enumerate(chunks)
+            }
+            for f in as_completed(futures):
+                idx = futures[f]
+                out_parts[idx] = f.result()
+                if progress_callback:
+                    progress_callback(len(chunks[idx]))
 
     return b"".join(out_parts)
 
@@ -1284,7 +1315,8 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         done_streams = 0
         done_bytes = [0]
         pbar_lock = threading.Lock()
-        with ThreadPoolExecutor() as executor:
+        stream_workers = min(max(1, REGEX_STREAM_WORKERS), max(1, len(candidate_xrefs)))
+        with ThreadPoolExecutor(max_workers=stream_workers) as executor:
             pbar = tqdm(
                 total=max(total_bytes, 1),
                 desc=f"      🔥 {desc}",
