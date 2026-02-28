@@ -8,6 +8,8 @@
 #   注意: 已完全移除PyTorch依赖，使用纯numpy实现DPM-Solver
 
 import os
+import glob
+from importlib.machinery import EXTENSION_SUFFIXES
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 block_cipher = None
@@ -29,6 +31,7 @@ hiddenimports = [
     'imagecodecs._jpeg2k',
     'imagecodecs._shared',
     'imagecodecs._shared_cython',
+    'vector_hotspot_cython_nogil',
 ]
 
 # 收集 onnxruntime-directml DLL 路径 (DirectML.dll等)
@@ -40,10 +43,22 @@ for _dll in ['DirectML.dll', 'onnxruntime.dll', 'onnxruntime_providers_shared.dl
     if os.path.exists(_dll_path):
         _ort_binaries.append((_dll_path, '.'))
 
+# 必须包含已编译的 Cython 扩展（否则直接失败，防止静默降级）
+_cython_ext_binaries = []
+for _suf in EXTENSION_SUFFIXES:
+    _cython_ext_binaries.extend(
+        [(p, '.') for p in glob.glob(f'vector_hotspot_cython_nogil*{_suf}')]
+    )
+if not _cython_ext_binaries:
+    raise FileNotFoundError(
+        "Missing compiled extension: vector_hotspot_cython_nogil*.pyd/.so. "
+        "Run: python build_cython_vector_hotspot.py build_ext --inplace"
+    )
+
 a = Analysis(
     ['compress.py'],
     pathex=[],
-    binaries=_ort_binaries,
+    binaries=_ort_binaries + _cython_ext_binaries,
     datas=[
         # 模型文件 (FP16 ONNX，体积减半，速度提升~40%)
         ('models/real-esrgan-x4plus-128-fp16.onnx', 'models'),

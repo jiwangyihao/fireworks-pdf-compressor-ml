@@ -26,8 +26,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # 单一矢量热点引擎（并发优化专用）
 try:
     import vector_hotspot_cython_nogil as _vector_engine  # type: ignore
-except Exception:
-    _vector_engine = None
+except Exception as e:
+    raise RuntimeError(
+        "未能加载必需的矢量加速引擎 vector_hotspot_cython_nogil。"
+        "请先编译 Cython 扩展并确保其被正确打包到可执行文件中。"
+    ) from e
 
 # === ML Pipeline 可用性检查 (不预加载模型) ===
 _ml_pipeline_available = None  # None=未检查, True=可用, False=不可用
@@ -1162,14 +1165,13 @@ def _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c):
 
 
 def _optimize_vector_stream(raw_data, sig_figs, enable_smart_c):
-    """单引擎执行：失败时回退内置正则实现。"""
-    if _vector_engine is not None and hasattr(_vector_engine, "optimize_stream_scan_nogil"):
-        try:
-            return _vector_engine.optimize_stream_scan_nogil(raw_data, sig_figs, False, 16)
-        except Exception:
-            pass
-
-    return _apply_vector_regex_passes(raw_data, sig_figs, enable_smart_c)
+    """单引擎执行：Cython 引擎为必需项，不允许回退。"""
+    if not hasattr(_vector_engine, "optimize_stream_scan_nogil"):
+        raise RuntimeError(
+            "vector_hotspot_cython_nogil 缺少 optimize_stream_scan_nogil，"
+            "请检查扩展编译/打包流程。"
+        )
+    return _vector_engine.optimize_stream_scan_nogil(raw_data, sig_figs, False, 16)
 
 
 def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progress_callback=None):

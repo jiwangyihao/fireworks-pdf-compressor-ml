@@ -28,6 +28,21 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Install Cython build dependency
+        run: uv run python -m pip install Cython
+
+      - name: Build Cython extension
+        run: uv run python build_cython_vector_hotspot.py build_ext --inplace
+
+      - name: Verify Cython extension artifact
+        shell: pwsh
+        run: |
+          $mods = Get-ChildItem -Path . -Include "vector_hotspot_cython_nogil*.pyd","vector_hotspot_cython_nogil*.so" -File -Recurse -ErrorAction SilentlyContinue
+          if (-not $mods -or $mods.Count -eq 0) {
+            throw "Cython extension artifact not found (vector_hotspot_cython_nogil)."
+          }
+          Write-Host "Found extension artifact: $($mods[0].FullName)"
+
       - name: Build EXE
         run: uv run pyinstaller --noconfirm compress.spec
 
