@@ -95,6 +95,7 @@ COLOR_STD_THRESHOLD = 5.0  # 判定是否为彩色的阈值 (越小越容易被�
 
 # 全局变量
 lossy_report_list = []
+large_file_report_list = []
 
 # === 安全打印函数 (避免 Windows GBK 编码问题) ===
 def safe_print(msg):
@@ -1927,7 +1928,7 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
 # ============================
 # 主流程
 # ============================
-def process_file(input_path, idx, total):
+def process_file(input_path, idx, total, unattended_mode=False):
     file_mb = get_file_mb(input_path)
     initially_under_threshold = file_mb < SIZE_THRESHOLD_MB
     base_name = os.path.basename(input_path)
@@ -2103,6 +2104,13 @@ def process_file(input_path, idx, total):
         safe_print(f"      ║  这些页面含有装饰色（如蓝色边框），但主体为灰度内容。")
         safe_print(f"      ║  栅格化后可启用二值化压缩，显著减小文件体积。")
         safe_print(f"      ╠══════════════════════════════════════════════════════════════╣")
+        safe_print(f"      ║  [提醒] 请先确认这些页面是否确实适合灰度化：")
+        safe_print(f"      ║         - 若文件已是清晰灰度稿，通常不必再次灰度化")
+        safe_print(f"      ║         - 若需要保留专色/彩色信息，不建议强制灰度化")
+        safe_print(f"      ║  [建议] 若文档为双色套印、以白底黑字为主，且文件体积较大（如 >100MB）的书籍扫描件，")
+        safe_print(f"      ║         通常推荐灰度化以提升压缩收益。")
+        safe_print(f"      ║         如不确定，建议先选 [4] 不执行灰度化，并人工抽检后再决定。")
+        safe_print(f"      ╠══════════════════════════════════════════════════════════════╣")
         safe_print(f"      ║  增强方式选择:")
         safe_print(f"      ║")
         safe_print(f"      ║  [1] ML增强 (ESRGAN + NAF-DPM + DoxaPy)")
@@ -2118,46 +2126,50 @@ def process_file(input_path, idx, total):
         safe_print(f"      ║      - 效果一般：基础去噪和对比度调整")
         safe_print(f"      ║      - 预计耗时: ~{estimated_traditional_time:.1f} 分钟")
         safe_print(f"      ║")
-        safe_print(f"      ║  [3] 跳过增强")
+        safe_print(f"      ║  [3] 执行灰度化但跳过增强")
         safe_print(f"      ║      - 仅栅格化为灰度，不做任何增强处理")
+        safe_print(f"      ║")
+        safe_print(f"      ║  [4] 不执行灰度化 (推荐用于不确定场景)")
+        safe_print(f"      ║      - 保持原页面色彩结构，不进行栅格化")
         safe_print(f"      ╚══════════════════════════════════════════════════════════════╝")
         
-        # 用户交互
-        try:
-            user_input = input("      --> 请选择 [1/2/3]，直接回车默认选择 2 (传统增强): ").strip()
-            
-            if user_input == '1':
-                safe_print(f"      [ML] 使用ML增强管线处理 {convert_count} 页...")
-                if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=True, use_ml=True):
-                    if current_file != input_path:
-                        safe_remove(current_file)
-                    current_file = tmp_gray
-                    safe_print(f"      [OK] ML增强完成: {get_file_mb(current_file):.2f} MB")
-                else:
-                    safe_print("      [WARN] ML增强过程出错。")
-            elif user_input == '3':
-                safe_print(f"      [SKIP] 跳过增强，仅栅格化...")
-                if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=False):
-                    if current_file != input_path:
-                        safe_remove(current_file)
-                    current_file = tmp_gray
-                    safe_print(f"      [OK] 栅格化完成: {get_file_mb(current_file):.2f} MB")
-            else:  # 默认选择 2
-                safe_print(f"      [传统] 使用传统增强处理 {convert_count} 页...")
-                if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=True, use_ml=False):
-                    if current_file != input_path:
-                        safe_remove(current_file)
-                    current_file = tmp_gray
-                    safe_print(f"      [OK] 传统增强完成: {get_file_mb(current_file):.2f} MB")
-                else:
-                    safe_print("      [WARN] 传统增强过程出错。")
-        except EOFError:
-            # 非交互模式，默认使用传统增强
-            safe_print("      [AUTO] 非交互模式，使用传统增强...")
-            if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=True, use_ml=False):
-                if current_file != input_path:
-                    safe_remove(current_file)
-                current_file = tmp_gray
+        # 用户交互 / 无人值守默认策略
+        if unattended_mode:
+            safe_print("      [AUTO] 无人值守模式：默认不执行灰度化，请后续人工抽检文件实际状态。")
+        else:
+            try:
+                user_input = input("      --> 请选择 [1/2/3/4]，直接回车默认选择 2 (传统增强): ").strip()
+
+                if user_input == '1':
+                    safe_print(f"      [ML] 使用ML增强管线处理 {convert_count} 页...")
+                    if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=True, use_ml=True):
+                        if current_file != input_path:
+                            safe_remove(current_file)
+                        current_file = tmp_gray
+                        safe_print(f"      [OK] ML增强完成: {get_file_mb(current_file):.2f} MB")
+                    else:
+                        safe_print("      [WARN] ML增强过程出错。")
+                elif user_input == '3':
+                    safe_print(f"      [SKIP] 跳过增强，仅栅格化...")
+                    if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=False):
+                        if current_file != input_path:
+                            safe_remove(current_file)
+                        current_file = tmp_gray
+                        safe_print(f"      [OK] 栅格化完成: {get_file_mb(current_file):.2f} MB")
+                elif user_input == '4':
+                    safe_print("      [SKIP] 按用户选择跳过灰度化，请人工核验页面真实色彩属性。")
+                else:  # 默认选择 2
+                    safe_print(f"      [传统] 使用传统增强处理 {convert_count} 页...")
+                    if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=True, use_ml=False):
+                        if current_file != input_path:
+                            safe_remove(current_file)
+                        current_file = tmp_gray
+                        safe_print(f"      [OK] 传统增强完成: {get_file_mb(current_file):.2f} MB")
+                    else:
+                        safe_print("      [WARN] 传统增强过程出错。")
+            except EOFError:
+                # 非交互模式，默认不执行灰度化
+                safe_print("      [AUTO] 非交互模式：默认不执行灰度化，请人工核验页面真实色彩属性。")
     else:
         safe_print("      [OK] 未检测到显著的单色装饰页面。")
 
@@ -2233,6 +2245,8 @@ def process_file(input_path, idx, total):
 
     # Final Save
     final_mb = get_file_mb(lossy_working_file)
+    final_report_name = base_name
+    final_report_mb = file_mb
     if final_mb < file_mb:
         root, ext = os.path.splitext(input_path)
         optimized_path = f"{root}_opted{ext}"
@@ -2243,12 +2257,19 @@ def process_file(input_path, idx, total):
             )
             # 只有有损压缩才添加到报告列表
             lossy_report_list.append((base_name, os.path.basename(optimized_path)))
+            final_report_name = os.path.basename(optimized_path)
+            final_report_mb = final_mb
         except:
             pass
     else:
         safe_print("      [SKIP] 未优化")
         if lossy_working_file != input_path:
             safe_remove(lossy_working_file)
+        final_report_name = base_name
+        final_report_mb = get_file_mb(input_path)
+
+    if final_report_mb > SIZE_THRESHOLD_MB:
+        large_file_report_list.append((base_name, final_report_name, final_report_mb))
 
     # Cleanup
     for s in stages:
@@ -2287,14 +2308,41 @@ def main():
         if f.lower().endswith(".pdf") and "_opted" not in f and ".tmp" not in f
     ]
 
+    global lossy_report_list, large_file_report_list
+    lossy_report_list = []
+    large_file_report_list = []
+
+    unattended_mode = False
+    if len(pdf_files) > 5:
+        safe_print("\n[INFO] 检测到待处理文件超过 5 个，可开启无人值守模式。")
+        safe_print("       无人值守模式下将不再询问用户意见，且检测到单色装饰模式时默认不进行灰度化。")
+        try:
+            choice = input("       --> 是否开启无人值守模式? [y/N]: ").strip().lower()
+            unattended_mode = choice in ("y", "yes")
+        except EOFError:
+            unattended_mode = True
+            safe_print("       [AUTO] 非交互环境：自动开启无人值守模式。")
+
+    if unattended_mode:
+        safe_print("[MODE] 当前运行模式：无人值守")
+    else:
+        safe_print("[MODE] 当前运行模式：交互")
+
     for idx, f in enumerate(pdf_files, 1):
-        process_file(f, idx, len(pdf_files))
+        process_file(f, idx, len(pdf_files), unattended_mode=unattended_mode)
 
     if lossy_report_list:
         print("\n" + "=" * 50)
         safe_print("[WARN] 以下文件触发了有损压缩 (阶段 2/3)，请务必检查内容完整性：")
         for orig, opt in lossy_report_list:
             print(f" - {orig} -> {opt}")
+        print("=" * 50 + "\n")
+
+    if large_file_report_list:
+        print("\n" + "=" * 50)
+        safe_print(f"[WARN] 以下文件在完整压缩流程后仍大于 {SIZE_THRESHOLD_MB}MB，请重点复核：")
+        for orig, final_name, final_mb in large_file_report_list:
+            print(f" - {orig} -> {final_name} ({final_mb:.2f} MB)")
         print("=" * 50 + "\n")
 
 
