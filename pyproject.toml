@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MPL-2.0"
 dependencies = [
+  "Cython",
   "numpy",
   "opencv-python",
   "pillow",

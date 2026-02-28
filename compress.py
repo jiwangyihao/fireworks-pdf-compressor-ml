@@ -8,6 +8,7 @@ import subprocess
 import multiprocessing
 import threading
 import zlib  # Added for Flate compression
+import importlib
 from pathlib import Path
 
 # 添加当前目录到路径，确保能导入本地模块
@@ -23,14 +24,47 @@ from PIL import Image, ImageFilter, ImageEnhance
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def _bootstrap_vector_engine():
+    """加载必需的 Cython 矢量引擎。
+
+    规则：
+    - EXE/冻结环境：缺失即直接报错。
+    - Python 脚本环境：若未找到扩展，则尝试自动编译一次；仍失败则报错并给出指引。
+    """
+    module_name = "vector_hotspot_cython_nogil"
+    try:
+        return importlib.import_module(module_name)
+    except Exception as first_exc:
+        is_frozen = bool(getattr(sys, "frozen", False))
+        build_script = SCRIPT_DIR / "build_cython_vector_hotspot.py"
+
+        if (not is_frozen) and build_script.exists():
+            try:
+                print("[INIT] 未检测到 Cython 矢量引擎，尝试自动编译...", flush=True)
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    [sys.executable, str(build_script), "build_ext", "--inplace"],
+                    cwd=str(SCRIPT_DIR),
+                    check=True,
+                )
+                importlib.invalidate_caches()
+                return importlib.import_module(module_name)
+            except Exception as build_exc:
+                raise RuntimeError(
+                    "未能自动编译必需的 Cython 矢量引擎。"
+                    "请先执行：uv sync --frozen && uv run python build_cython_vector_hotspot.py build_ext --inplace"
+                ) from build_exc
+
+        raise RuntimeError(
+            "未能加载必需的矢量加速引擎 vector_hotspot_cython_nogil。"
+            "请先编译 Cython 扩展并确保其被正确打包到可执行文件中。"
+        ) from first_exc
+
+
 # 单一矢量热点引擎（并发优化专用）
-try:
-    import vector_hotspot_cython_nogil as _vector_engine  # type: ignore
-except Exception as e:
-    raise RuntimeError(
-        "未能加载必需的矢量加速引擎 vector_hotspot_cython_nogil。"
-        "请先编译 Cython 扩展并确保其被正确打包到可执行文件中。"
-    ) from e
+_vector_engine = _bootstrap_vector_engine()
 
 # === ML Pipeline 可用性检查 (不预加载模型) ===
 _ml_pipeline_available = None  # None=未检查, True=可用, False=不可用

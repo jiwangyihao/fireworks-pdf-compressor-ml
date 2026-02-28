@@ -27,7 +27,7 @@ jobs:
         run: uv sync --frozen
 
       - name: Build Cython extension
-        run: uv run --with Cython python build_cython_vector_hotspot.py build_ext --inplace
+        run: uv run python build_cython_vector_hotspot.py build_ext --inplace
 
       - name: Verify Cython extension artifact
         shell: pwsh

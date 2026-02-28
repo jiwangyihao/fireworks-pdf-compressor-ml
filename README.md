@@ -67,6 +67,10 @@
 
 `uv run python compress.py`
 
+> 说明：矢量压缩依赖 `vector_hotspot_cython_nogil` 扩展。
+> - 直接运行 Python 脚本时，程序会在缺失扩展时自动尝试编译一次。
+> - 若自动编译失败，可手动执行：`uv run python build_cython_vector_hotspot.py build_ext --inplace`
+
 ### 构建 EXE（可选）
 
 `uv run pyinstaller --noconfirm compress.spec`
@@ -154,6 +158,10 @@ Install dependencies:
 Run:
 
 `uv run python compress.py`
+
+> Note: vector compression requires the `vector_hotspot_cython_nogil` extension.
+> - In Python-script mode, the program will try to build it once automatically when missing.
+> - If auto-build fails, run manually: `uv run python build_cython_vector_hotspot.py build_ext --inplace`
 
 ### Build EXE (optional)
 
