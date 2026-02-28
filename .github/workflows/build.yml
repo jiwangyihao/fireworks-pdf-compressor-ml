@@ -26,11 +26,8 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
-      - name: Install Cython build dependency
-        run: uv run python -m pip install Cython
-
       - name: Build Cython extension
-        run: uv run python build_cython_vector_hotspot.py build_ext --inplace
+        run: uv run --with Cython python build_cython_vector_hotspot.py build_ext --inplace
 
       - name: Verify Cython extension artifact
         shell: pwsh
