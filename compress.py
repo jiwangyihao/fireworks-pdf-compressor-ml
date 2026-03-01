@@ -1515,112 +1515,85 @@ def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progres
     return b"".join(out_parts)
 
 
-def process_regex_chunk(file_path, xref_list, sig_figs, enable_smart_c, progress_callback=None):
-    results = {}
-    inline_img_re = re.compile(rb"(^|\s)BI(\s|$)")
-    try:
-        with pikepdf.open(file_path) as pdf:
-            for xref in xref_list:
-                try:
-                    stream_obj = pdf.objects[xref]
-                    if not isinstance(stream_obj, pikepdf.Stream):
-                        continue
-                    subtype = str(stream_obj.get("/Subtype") or "")
-                    if "/Image" in subtype or "/Font" in subtype:
-                        continue
-                    raw_data = stream_obj.read_bytes()
-                    if inline_img_re.search(raw_data):
-                        if progress_callback:
-                            progress_callback(len(raw_data))
-                        continue
-
-                    d = _split_and_optimize_large_stream(
-                        raw_data, sig_figs, enable_smart_c, progress_callback=progress_callback
-                    )
-
-                    if len(d) < len(raw_data):
-                        results[xref] = d
-                except:
-                    continue
-        return results
-    except:
-        return {}
-
-
 def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
     try:
-        candidate_with_size = []
+        inline_img_re = re.compile(rb"(^|\\s)BI(\\s|$)")
+
+        # Phase 1: 单次 open，读取全部候选流到内存
+        candidate_raw = {}  # xref -> raw_bytes
         with pikepdf.open(input_path) as pdf:
             for i, obj in enumerate(pdf.objects):
                 if isinstance(obj, pikepdf.Stream):
                     subtype = str(obj.get("/Subtype") or "")
                     if "/Image" not in subtype and "/Font" not in subtype:
-                        # 用“解码后真实流长度”统计进度总量，避免 /Length(压缩长度) 失真
                         try:
-                            stream_len = len(obj.read_bytes())
+                            raw = obj.read_bytes()
+                            if not inline_img_re.search(raw):
+                                candidate_raw[i] = raw
                         except:
-                            try:
-                                stream_len = int(obj.get("/Length") or 0)
-                            except:
-                                stream_len = 0
-                        candidate_with_size.append((i, stream_len))
+                            pass
 
-        candidate_with_size.sort(key=lambda x: x[1])
-        candidate_xrefs = [x[0] for x in candidate_with_size]
-        size_map = {x[0]: max(int(x[1]), 1) for x in candidate_with_size}
-        total_bytes = sum(size_map.values())
-
-        if not candidate_xrefs:
+        if not candidate_raw:
             return False
 
+        total_bytes = sum(len(v) for v in candidate_raw.values())
+        total_xrefs = len(candidate_raw)
+
+        # Phase 2: 多线程并行 Cython 处理（纯内存，不再打开 PDF）
         all_results = {}
-        done_streams = 0
         done_bytes = [0]
+        done_streams = [0]
         pbar_lock = threading.Lock()
-        stream_workers = min(max(1, REGEX_STREAM_WORKERS), max(1, len(candidate_xrefs)))
-        with ThreadPoolExecutor(max_workers=stream_workers) as executor:
-            pbar = tqdm(
-                total=max(total_bytes, 1),
-                desc=f"      🔥 {desc}",
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
+        stream_workers = min(max(1, REGEX_STREAM_WORKERS), total_xrefs)
+
+        pbar = tqdm(
+            total=max(total_bytes, 1),
+            desc=f"      🔥 {desc}",
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+        )
+
+        def on_bytes_done(nbytes):
+            with pbar_lock:
+                remaining = max(total_bytes - done_bytes[0], 0)
+                inc = min(max(int(nbytes), 0), remaining)
+                if inc > 0:
+                    pbar.update(inc)
+                    done_bytes[0] += inc
+
+        def _process_one(xref_raw):
+            xref, raw_data = xref_raw
+            d = _split_and_optimize_large_stream(
+                raw_data, sig_figs, enable_smart_c, progress_callback=on_bytes_done
             )
+            if len(d) < len(raw_data):
+                return (xref, d)
+            return None
 
-            def on_bytes_done(nbytes):
-                with pbar_lock:
-                    remaining = max(total_bytes - done_bytes[0], 0)
-                    inc = min(max(int(nbytes), 0), remaining)
-                    if inc > 0:
-                        pbar.update(inc)
-                        done_bytes[0] += inc
-
+        with ThreadPoolExecutor(max_workers=stream_workers) as executor:
             futures = {
-                executor.submit(
-                    process_regex_chunk,
-                    input_path,
-                    [xref],
-                    sig_figs,
-                    enable_smart_c,
-                    on_bytes_done,
-                ): xref
-                for xref in candidate_xrefs
+                executor.submit(_process_one, item): item[0]
+                for item in candidate_raw.items()
             }
             for f in as_completed(futures):
-                xref = futures[f]
-                done_streams += 1
-                pbar.set_postfix(streams=f"{done_streams}/{len(candidate_xrefs)}")
+                res = f.result()
+                done_streams[0] += 1
+                if res:
+                    all_results[res[0]] = res[1]
+                pbar.set_postfix(streams=f"{done_streams[0]}/{total_xrefs}")
 
-                if res := f.result():
-                    all_results.update(res)
+        if done_bytes[0] < total_bytes:
+            pbar.update(total_bytes - done_bytes[0])
+        pbar.close()
 
-            # 兜底补齐进度条（避免估算误差导致未满）
-            if done_bytes[0] < total_bytes:
-                pbar.update(total_bytes - done_bytes[0])
-            pbar.close()
+        # 释放原始数据内存
+        candidate_raw.clear()
 
         if not all_results:
             return False
+
+        # Phase 3: 单次 open，写回优化结果
         with pikepdf.open(input_path) as pdf:
             for xref, data in all_results.items():
                 pdf.objects[xref].write(data)
@@ -1633,6 +1606,7 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         return is_valid_pdf(output_path)
     except:
         return False
+
 
 
 # ============================
