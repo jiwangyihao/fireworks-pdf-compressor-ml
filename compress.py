@@ -1838,10 +1838,42 @@ def compress_image_chunk_worker(xref_chunk, target_quality, pdf_path, mixed_page
     return results
 
 
-def _encode_single_image(xref, pil_image, orig_raw_size, target_quality, mixed_page_xrefs):
+def _encode_single_image(xref, pil_image, orig_raw_size, target_quality, mixed_page_xrefs, is_dct_cmyk=False):
     """Phase B 编码函数：使用 imagecodecs 实现 GIL-free JPEG2000 编码，可安全多线程并发。
     与 _compress_single_xref 逻辑一致，但不依赖 pikepdf 对象（图片已在 Phase A 提取）。
     """
+    # CMYK 图片：跳过灰度检测和二值化，直接走 JP2K 编码路径。
+    # detect_strict_color 会将 CMYK 转 RGB 检测，低饱和度 CMYK 被误判为灰度后
+    # 在混合页面触发二值化(1-bit DeviceGray)，完全破坏 CMYK 色彩信息。
+    if pil_image.mode == "CMYK":
+        try:
+            img_arr = np.asarray(pil_image)
+            # DCTDecode CMYK 使用反转通道约定(0=满墨, 255=无墨)，
+            # 需反转为标准 PDF DeviceCMYK 约定(0=无墨, 255=满墨)，
+            # 否则 JPXDecode 渲染器按标准约定解读会产生色彩反转。
+            if is_dct_cmyk:
+                img_arr = 255 - img_arr
+            # CMYK 必须关闭 MCT（多分量变换仅适用于 RGB/YCbCr）
+            if target_quality is not None:
+                new_data = imagecodecs.jpeg2k_encode(
+                    img_arr, level=target_quality, mct=False, numthreads=JP2K_THREADS
+                )
+            else:
+                new_data = imagecodecs.jpeg2k_encode(
+                    img_arr, level=0, mct=False, numthreads=JP2K_THREADS
+                )
+        except Exception:
+            return None
+        if len(new_data) >= orig_raw_size:
+            return None
+        return {
+            "xref": xref,
+            "data": new_data,
+            "width": pil_image.width,
+            "height": pil_image.height,
+            "mode": "CMYK",
+        }
+
     # 1. 严格灰度检测
     is_color = detect_strict_color(
         pil_image, grid_size=GRID_SIZE, threshold=COLOR_STD_THRESHOLD
@@ -1922,7 +1954,7 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
 
     # === Phase A: 单线程提取 (GIL-bound pikepdf) ===
     # 只打开PDF一次，提取所有图片为PIL对象 + 原始大小
-    extracted = []  # list of (xref, pil_image, orig_raw_size)
+    extracted = []  # list of (xref, pil_image, orig_raw_size, is_dct_cmyk)
     try:
         with pikepdf.open(input_path) as pdf:
             for i, obj in enumerate(pdf.objects):
@@ -1933,31 +1965,18 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     # 跳过带mask的图片
                     if "/SMask" in obj or "/Mask" in obj:
                         continue
-                    # 跳过 CMYK 图片（JPEG2000 重编码会丢失 CMYK→RGB 色彩信息）
-                    cs = obj.get("/ColorSpace", None)
-                    if cs == "/DeviceCMYK":
-                        continue
-                    if isinstance(cs, pikepdf.Array) and len(cs) > 0:
-                        base_cs = str(cs[0])
-                        if base_cs == "/DeviceCMYK":
-                            continue
-                        if base_cs == "/Indexed" and len(cs) > 1:
-                            idx_base = str(cs[1])
-                            if idx_base == "/DeviceCMYK":
-                                continue
-                        if base_cs == "/ICCBased" and len(cs) > 1:
-                            try:
-                                n = int(cs[1].get("/N", 0))
-                                if n == 4:
-                                    continue
-                            except Exception:
-                                pass
                     try:
                         pdfimage = pikepdf.PdfImage(obj)
                         pil_image = pdfimage.as_pil_image()
                         if pil_image.width * pil_image.height > 100_000_000:
                             continue
-                        extracted.append((i, pil_image, raw_size))
+                        # 标记 DCTDecode CMYK：JPEG CMYK 使用反转通道值约定(0=满墨)
+                        # 而 FlateDecode/Indexed CMYK 使用标准约定(0=无墨)
+                        is_dct_cmyk = (
+                            pil_image.mode == "CMYK"
+                            and str(obj.get("/Filter")) == "/DCTDecode"
+                        )
+                        extracted.append((i, pil_image, raw_size, is_dct_cmyk))
                     except Exception:
                         continue
     except Exception:
@@ -1987,10 +2006,10 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
 
     with ThreadPoolExecutor(max_workers=JP2K_WORKERS) as executor:
         futures = []
-        for xref, pil_image, orig_raw_size in extracted:
+        for xref, pil_image, orig_raw_size, is_dct_cmyk in extracted:
             f = executor.submit(
                 _encode_single_image, xref, pil_image, orig_raw_size,
-                quality_db, mixed_page_xrefs
+                quality_db, mixed_page_xrefs, is_dct_cmyk
             )
             f.add_done_callback(on_encode_done)
             futures.append(f)
@@ -2022,11 +2041,12 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                         obj.write(res["data"], filter=pikepdf.Name("/JPXDecode"))
                         obj.Width = res["width"]
                         obj.Height = res["height"]
-                        obj.ColorSpace = (
-                            pikepdf.Name("/DeviceRGB")
-                            if res["mode"] == "RGB"
-                            else pikepdf.Name("/DeviceGray")
-                        )
+                        if res["mode"] == "CMYK":
+                            obj.ColorSpace = pikepdf.Name("/DeviceCMYK")
+                        elif res["mode"] == "RGB":
+                            obj.ColorSpace = pikepdf.Name("/DeviceRGB")
+                        else:
+                            obj.ColorSpace = pikepdf.Name("/DeviceGray")
                         obj.BitsPerComponent = 8
                         if "/Filter" in obj:
                             obj.Filter = pikepdf.Name("/JPXDecode")
@@ -2034,6 +2054,8 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     # 清理通用属性
                     if "/DecodeParms" in obj:
                         del obj["/DecodeParms"]  # type: ignore
+                    if "/Decode" in obj:
+                        del obj["/Decode"]  # type: ignore
                     if "/ICCProfile" in obj:
                         del obj["/ICCProfile"]  # type: ignore
                 pdf.remove_unreferenced_resources()
