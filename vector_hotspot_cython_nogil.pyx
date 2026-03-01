@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from libc.stdlib cimport strtod, malloc, free
 from libc.stdio cimport snprintf
-from libc.math cimport floor
+from libc.math cimport floor, log10, fabs, pow as cpow
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.string cimport memcpy
 
@@ -167,10 +167,13 @@ cdef inline Py_ssize_t _skip_ws(const char* s, Py_ssize_t i, Py_ssize_t n) nogil
 cdef inline int _format_shorter(const char* s, Py_ssize_t st, Py_ssize_t ed, int sig_figs, char* outbuf) nogil:
     cdef char numbuf[128]
     cdef char* endptr
-    cdef double val
+    cdef double val, av, scale
     cdef int out_len
     cdef int k
+    cdef int dec_places
+    cdef int leading
     cdef int tok_len = <int>(ed - st)
+    cdef bint has_dot
 
     if tok_len <= 0 or tok_len >= 120:
         return 0
@@ -183,14 +186,39 @@ cdef inline int _format_shorter(const char* s, Py_ssize_t st, Py_ssize_t ed, int
         return 0
 
     if floor(val) == val:
+        # Integer value: round to sig_figs significant figures
+        av = fabs(val)
+        if av >= 1.0:
+            leading = <int>floor(log10(av)) + 1
+            if leading > sig_figs:
+                scale = cpow(10.0, <double>(leading - sig_figs))
+                val = floor(val / scale + 0.5) * scale
         out_len = snprintf(outbuf, 128, "%.0f", val)
     else:
-        out_len = snprintf(outbuf, 128, "%.*f", sig_figs, val)
+        # Non-integer: compute decimal places for sig_figs significant figures
+        av = fabs(val)
+        if av >= 1.0:
+            leading = <int>floor(log10(av)) + 1
+            dec_places = sig_figs - leading
+        else:
+            dec_places = <int>(-floor(log10(av))) - 1 + sig_figs
+        # When dec_places < 0, round off integer digits first
+        if dec_places < 0:
+            scale = cpow(10.0, <double>(-dec_places))
+            val = floor(val / scale + 0.5) * scale
+            dec_places = 0
+        out_len = snprintf(outbuf, 128, "%.*f", dec_places, val)
 
     if out_len <= 0 or out_len >= 120:
         return 0
 
-    if floor(val) != val:
+    # Strip trailing zeros only when there is a decimal point
+    has_dot = False
+    for k in range(out_len):
+        if outbuf[k] == c'.':
+            has_dot = True
+            break
+    if has_dot:
         k = out_len - 1
         while k >= 0 and outbuf[k] == c'0':
             k -= 1
@@ -201,6 +229,7 @@ cdef inline int _format_shorter(const char* s, Py_ssize_t st, Py_ssize_t ed, int
             outbuf[0] = c'0'
             out_len = 1
 
+    # Leading zero compression: "0.xxx" -> ".xxx"
     if out_len >= 2 and outbuf[0] == c'0' and outbuf[1] == c'.':
         memcpy(outbuf, outbuf + 1, out_len - 1)
         out_len -= 1
