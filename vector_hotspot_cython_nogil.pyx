@@ -4,11 +4,11 @@ from __future__ import annotations
 import re
 from libc.stdlib cimport strtod, malloc, free
 from libc.stdio cimport snprintf
-from libc.math cimport floor, log10, fabs, pow as cpow
+from libc.math cimport floor, log10, fabs, pow as cpow, sqrt as csqrt
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.string cimport memcpy
 
-CURVE_SIMPLIFY_THRESHOLD = 0.5
+CURVE_SIMPLIFY_THRESHOLD = 0.20
 
 NUM_RE = rb"[-+]?(?:\d*\.\d+|\d+)"
 L_PATTERN = re.compile(rb"(" + NUM_RE + rb")(\s+)(" + NUM_RE + rb")(\s+)(l)(?=\s|$)")
@@ -396,7 +396,18 @@ cdef Py_ssize_t _scan_replace_core(const char* src, Py_ssize_t n, int sig_figs, 
     return w
 
 
-def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint debug=False, int debug_step_mb=8):
+cdef inline double _parse_double(const char* src, Py_ssize_t start, Py_ssize_t end, char* buf) nogil:
+    """Parse a double from src[start:end] using a temp buffer for null-termination."""
+    cdef Py_ssize_t length = end - start
+    cdef char* endptr
+    if length <= 0 or length >= 127:
+        return 0.0
+    memcpy(buf, src + start, length)
+    buf[length] = c'\0'
+    return strtod(buf, &endptr)
+
+
+def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart_c=False, double curve_threshold=0.20):
     cdef Py_ssize_t n = len(raw_data)
     cdef const char* src = raw_data
     cdef char* dst = <char*>malloc(n + 1)
@@ -411,7 +422,13 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint debug=False,
     cdef int idx
     cdef int k
     cdef char fmtbuf[128]
+    cdef char numbuf_tmp[128]
     cdef bytes out
+    # 曲线简化: 当前点追踪
+    cdef double cur_x = 0.0, cur_y = 0.0
+    cdef double subpath_x = 0.0, subpath_y = 0.0
+    cdef double cp1x, cp1y, cp2x, cp2y, epx, epy
+    cdef double dx, dy, line_len_sq, line_len, cross1, cross2, dist1, dist2, max_dist
 
     if dst == NULL:
         return raw_data
@@ -419,28 +436,102 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint debug=False,
     with nogil:
         while i < n:
             if not _looks_number_start(src, i, n):
+                # h (closepath) 重置当前点到子路径起点
+                if enable_smart_c and src[i] == c'h':
+                    cur_x = subpath_x
+                    cur_y = subpath_y
                 dst[w] = src[i]
                 w += 1
                 i += 1
                 continue
 
-            # 尝试匹配 c(6), vy(4), ml(2), w(1)
+            # === c 命令 (6 参数) ===
             if _match_cmd(src, i, n, 6, c'c', c'c', &ns[0], &ne[0], &ws_s[0], &ws_e[0], &op_pos[0]):
-                k = 6
-            elif _match_cmd(src, i, n, 4, c'v', c'y', &ns[0], &ne[0], &ws_s[0], &ws_e[0], &op_pos[0]):
+                if enable_smart_c:
+                    cp1x = _parse_double(src, ns[0], ne[0], numbuf_tmp)
+                    cp1y = _parse_double(src, ns[1], ne[1], numbuf_tmp)
+                    cp2x = _parse_double(src, ns[2], ne[2], numbuf_tmp)
+                    cp2y = _parse_double(src, ns[3], ne[3], numbuf_tmp)
+                    epx  = _parse_double(src, ns[4], ne[4], numbuf_tmp)
+                    epy  = _parse_double(src, ns[5], ne[5], numbuf_tmp)
+
+                    # 计算控制点到弦 (cur→end) 的最大距离
+                    dx = epx - cur_x
+                    dy = epy - cur_y
+                    line_len_sq = dx * dx + dy * dy
+                    if line_len_sq < 1e-12:
+                        dist1 = csqrt((cp1x - cur_x) * (cp1x - cur_x) + (cp1y - cur_y) * (cp1y - cur_y))
+                        dist2 = csqrt((cp2x - cur_x) * (cp2x - cur_x) + (cp2y - cur_y) * (cp2y - cur_y))
+                    else:
+                        line_len = csqrt(line_len_sq)
+                        cross1 = (cp1x - cur_x) * dy - (cp1y - cur_y) * dx
+                        cross2 = (cp2x - cur_x) * dy - (cp2y - cur_y) * dx
+                        dist1 = fabs(cross1) / line_len
+                        dist2 = fabs(cross2) / line_len
+                    max_dist = dist1 if dist1 > dist2 else dist2
+
+                    if max_dist < curve_threshold:
+                        # c → l 简化: 只输出 x3 y3 l
+                        out_len = _format_shorter(src, ns[4], ne[4], sig_figs, fmtbuf)
+                        if out_len > 0:
+                            memcpy(dst + w, fmtbuf, out_len)
+                            w += out_len
+                        else:
+                            memcpy(dst + w, src + ns[4], ne[4] - ns[4])
+                            w += (ne[4] - ns[4])
+                        dst[w] = c' '
+                        w += 1
+                        out_len = _format_shorter(src, ns[5], ne[5], sig_figs, fmtbuf)
+                        if out_len > 0:
+                            memcpy(dst + w, fmtbuf, out_len)
+                            w += out_len
+                        else:
+                            memcpy(dst + w, src + ns[5], ne[5] - ns[5])
+                            w += (ne[5] - ns[5])
+                        dst[w] = c' '
+                        w += 1
+                        dst[w] = c'l'
+                        w += 1
+                        cur_x = epx
+                        cur_y = epy
+                        i = op_pos[0] + 1
+                        continue
+                    # 未简化, 更新当前点后正常输出
+                    cur_x = epx
+                    cur_y = epy
+                # 正常输出 c 命令的 6 个参数
+                for idx in range(6):
+                    out_len = _format_shorter(src, ns[idx], ne[idx], sig_figs, fmtbuf)
+                    if out_len > 0:
+                        memcpy(dst + w, fmtbuf, out_len)
+                        w += out_len
+                    else:
+                        memcpy(dst + w, src + ns[idx], ne[idx] - ns[idx])
+                        w += (ne[idx] - ns[idx])
+                    memcpy(dst + w, src + ws_s[idx], ws_e[idx] - ws_s[idx])
+                    w += (ws_e[idx] - ws_s[idx])
+                dst[w] = src[op_pos[0]]
+                w += 1
+                i = op_pos[0] + 1
+                continue
+
+            # === v/y 命令 (4 参数) ===
+            if _match_cmd(src, i, n, 4, c'v', c'y', &ns[0], &ne[0], &ws_s[0], &ws_e[0], &op_pos[0]):
                 k = 4
+            # === m/l 命令 (2 参数) ===
             elif _match_cmd(src, i, n, 2, c'm', c'l', &ns[0], &ne[0], &ws_s[0], &ws_e[0], &op_pos[0]):
                 k = 2
+            # === w 命令 (1 参数) ===
             elif _match_cmd(src, i, n, 1, c'w', c'w', &ns[0], &ne[0], &ws_s[0], &ws_e[0], &op_pos[0]):
                 k = 1
             else:
-                # 非目标运算符上下文，原样复制当前 number token
                 ne[0] = _parse_num_end(src, i, n)
                 memcpy(dst + w, src + i, ne[0] - i)
                 w += (ne[0] - i)
                 i = ne[0]
                 continue
 
+            # 正常输出 v/y, m/l, w 命令
             for idx in range(k):
                 out_len = _format_shorter(src, ns[idx], ne[idx], sig_figs, fmtbuf)
                 if out_len > 0:
@@ -449,12 +540,19 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint debug=False,
                 else:
                     memcpy(dst + w, src + ns[idx], ne[idx] - ns[idx])
                     w += (ne[idx] - ns[idx])
-
                 memcpy(dst + w, src + ws_s[idx], ws_e[idx] - ws_s[idx])
                 w += (ws_e[idx] - ws_s[idx])
-
             dst[w] = src[op_pos[0]]
             w += 1
+
+            # 追踪当前点 (m/l: 最后2参数, v/y: 最后2参数)
+            if enable_smart_c and k >= 2:
+                cur_x = _parse_double(src, ns[k - 2], ne[k - 2], numbuf_tmp)
+                cur_y = _parse_double(src, ns[k - 1], ne[k - 1], numbuf_tmp)
+                if k == 2 and src[op_pos[0]] == c'm':
+                    subpath_x = cur_x
+                    subpath_y = cur_y
+
             i = op_pos[0] + 1
 
     out = <bytes>PyBytes_FromStringAndSize(dst, w)

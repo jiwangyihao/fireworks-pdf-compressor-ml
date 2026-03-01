@@ -108,7 +108,7 @@ except AttributeError:
 SIZE_THRESHOLD_MB = 100
 MIN_IMAGE_SIZE = 2048
 CHUNK_SIZE = 20
-CURVE_SIMPLIFY_THRESHOLD = 0.5
+CURVE_SIMPLIFY_THRESHOLD = 0.20
 CPU_CORES = max(1, multiprocessing.cpu_count() - 1)
 
 # JPEG2000 编码并行策略 (imagecodecs + OpenJPEG)
@@ -1519,7 +1519,9 @@ def _optimize_vector_stream(raw_data, sig_figs, enable_smart_c):
             "vector_hotspot_cython_nogil 缺少 optimize_stream_scan_nogil，"
             "请检查扩展编译/打包流程。"
         )
-    return _vector_engine.optimize_stream_scan_nogil(raw_data, sig_figs, False, 16)
+    return _vector_engine.optimize_stream_scan_nogil(
+        raw_data, sig_figs, enable_smart_c, CURVE_SIMPLIFY_THRESHOLD
+    )
 
 
 def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progress_callback=None):
@@ -1723,9 +1725,18 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
 def _compress_single_xref(pdf, xref, target_quality, mixed_page_xrefs):
     """单个xref的压缩逻辑（接受已打开的pdf对象，避免重复打开PDF）"""
     image_obj = pdf.objects[xref]
-    # Safety Checks
-    if "/SMask" in image_obj or "/Mask" in image_obj:
+    # Safety Checks - 硬 Mask 仍然跳过
+    if "/Mask" in image_obj:
         return None
+    # SMask: 检测全 255（完全不透明）的 trivial SMask，可安全忽略并继续处理
+    if "/SMask" in image_obj:
+        try:
+            smask_obj = image_obj["/SMask"]
+            smask_data = bytes(smask_obj.read_bytes())
+            if smask_data != b'\xff' * len(smask_data):
+                return None  # 非 trivial SMask，跳过
+        except Exception:
+            return None
 
     try:
         pdfimage = pikepdf.PdfImage(image_obj)
@@ -1955,6 +1966,7 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
     # === Phase A: 单线程提取 (GIL-bound pikepdf) ===
     # 只打开PDF一次，提取所有图片为PIL对象 + 原始大小
     extracted = []  # list of (xref, pil_image, orig_raw_size, is_dct_cmyk)
+    trivial_smask_xrefs = set()  # 记录需要移除的全透明 SMask 图片 xref
     try:
         with pikepdf.open(input_path) as pdf:
             for i, obj in enumerate(pdf.objects):
@@ -1962,9 +1974,23 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     raw_size = len(obj.read_raw_bytes())
                     if raw_size < MIN_IMAGE_SIZE:
                         continue
-                    # 跳过带mask的图片
-                    if "/SMask" in obj or "/Mask" in obj:
+                    # 硬 Mask（非 SMask）仍然跳过
+                    if "/Mask" in obj:
                         continue
+                    # SMask 检测：全 255 的 SMask（完全不透明）可安全移除
+                    has_smask = "/SMask" in obj
+                    if has_smask:
+                        try:
+                            smask_obj = obj["/SMask"]
+                            smask_data = bytes(smask_obj.read_bytes())
+                            # 检查是否全部为 255（完全不透明）
+                            if smask_data == b'\xff' * len(smask_data):
+                                trivial_smask_xrefs.add(i)
+                                raw_size += len(smask_obj.read_raw_bytes())
+                            else:
+                                continue  # 非 trivial SMask，跳过
+                        except Exception:
+                            continue
                     try:
                         pdfimage = pikepdf.PdfImage(obj)
                         pil_image = pdfimage.as_pil_image()
@@ -2028,6 +2054,11 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
             with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
                 for res in results:
                     obj = pdf.objects[res["xref"]]
+
+                    # 移除已确认为 trivial 的 SMask 引用
+                    if res["xref"] in trivial_smask_xrefs:
+                        if "/SMask" in obj:
+                            del obj["/SMask"]
 
                     if res.get("mode") == "1":
                         # 二值化图片 (FlateDecode)
