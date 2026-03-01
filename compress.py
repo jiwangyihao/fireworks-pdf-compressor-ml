@@ -1933,6 +1933,25 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     # 跳过带mask的图片
                     if "/SMask" in obj or "/Mask" in obj:
                         continue
+                    # 跳过 CMYK 图片（JPEG2000 重编码会丢失 CMYK→RGB 色彩信息）
+                    cs = obj.get("/ColorSpace", None)
+                    if cs == "/DeviceCMYK":
+                        continue
+                    if isinstance(cs, pikepdf.Array) and len(cs) > 0:
+                        base_cs = str(cs[0])
+                        if base_cs == "/DeviceCMYK":
+                            continue
+                        if base_cs == "/Indexed" and len(cs) > 1:
+                            idx_base = str(cs[1])
+                            if idx_base == "/DeviceCMYK":
+                                continue
+                        if base_cs == "/ICCBased" and len(cs) > 1:
+                            try:
+                                n = int(cs[1].get("/N", 0))
+                                if n == 4:
+                                    continue
+                            except Exception:
+                                pass
                     try:
                         pdfimage = pikepdf.PdfImage(obj)
                         pil_image = pdfimage.as_pil_image()
