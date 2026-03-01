@@ -1522,6 +1522,25 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         # Phase 1: 单次 open，读取全部候选流到内存
         candidate_raw = {}  # xref -> raw_bytes
         with pikepdf.open(input_path) as pdf:
+            # 自适应 sig_figs：超大页面需要更高精度以保护细微矢量特征
+            _BASE_DIM = 612.0  # 标准 A4 宽度 (pt)
+            max_page_dim = 0.0
+            for page in pdf.pages:
+                mb = page.get("/MediaBox")
+                if mb:
+                    try:
+                        w = abs(float(mb[2]) - float(mb[0]))
+                        h = abs(float(mb[3]) - float(mb[1]))
+                        max_page_dim = max(max_page_dim, w, h)
+                    except Exception:
+                        pass
+            if max_page_dim > _BASE_DIM:
+                import math as _m
+                extra_sf = round(_m.log10(max_page_dim / _BASE_DIM))
+                if extra_sf > 0:
+                    sig_figs = sig_figs + extra_sf
+                    safe_print(f"      [自适应] 页面最大尺寸 {max_page_dim:.0f}pt > 标准 {_BASE_DIM:.0f}pt, sig_figs {sig_figs - extra_sf}→{sig_figs}")
+
             for i, obj in enumerate(pdf.objects):
                 if isinstance(obj, pikepdf.Stream):
                     subtype = str(obj.get("/Subtype") or "")
