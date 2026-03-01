@@ -292,6 +292,15 @@ def _get_page_content_stream_pairs(page_obj):
 
 
 _GS_REF_RE = re.compile(rb"/([^\s/<>\[\]\(\)%]+)\s+gs(?=\s|$)")
+_XOBJ_REF_RE = re.compile(rb"/([^\s/<>\[\]\(\)%]+)\s+Do(?=\s|$)")
+_CS_REF_RE = re.compile(rb"/([^\s/<>\[\]\(\)%]+)\s+(?:cs|CS)(?=\s|$)")
+
+# 资源类型 → (regex, PDF资源子字典键名)
+_RESOURCE_REF_PATTERNS = [
+    (_GS_REF_RE, "/ExtGState"),
+    (_XOBJ_REF_RE, "/XObject"),
+    (_CS_REF_RE, "/ColorSpace"),
+]
 
 
 def _extract_gs_refs_from_stream(stream_obj):
@@ -301,6 +310,23 @@ def _extract_gs_refs_from_stream(stream_obj):
         return set(m.decode("latin1", "ignore") for m in _GS_REF_RE.findall(data))
     except:
         return set()
+
+
+def _extract_all_resource_refs(stream_obj):
+    """提取内容流中所有资源引用，按类型分组。
+
+    返回: {"/ExtGState": set, "/XObject": set, "/ColorSpace": set}
+    """
+    result = {}
+    try:
+        data = stream_obj.read_bytes()
+        for regex, res_key in _RESOURCE_REF_PATTERNS:
+            names = set(m.decode("latin1", "ignore") for m in regex.findall(data))
+            if names:
+                result[res_key] = names
+    except:
+        pass
+    return result
 
 
 def _get_page_extgstate_keys(page_obj):
@@ -400,6 +426,52 @@ def _inject_prev_extgstate_aliases(prev_page, cand_page, missing_refs, cand_pdf)
         return False
 
 
+def _inject_missing_resources(prev_page, cand_page, refs_by_type, cand_pdf):
+    """通用资源注入：将 prev 页面中缺失的资源条目注入 cand 页面。
+
+    refs_by_type: {"/XObject": {"Im0","Im1"}, "/ColorSpace": {"CS2"}, ...}
+    仅注入 cand 页面资源字典中确实缺失的条目。
+    返回 True 如果所有缺失条目均成功注入。
+    """
+    if not refs_by_type:
+        return True
+    try:
+        prev_res = _get_page_resources_dict(prev_page)
+        if not isinstance(prev_res, pikepdf.Dictionary):
+            return False
+
+        # 确保 cand 页面有自己的可写资源字典
+        if "/Resources" in cand_page and isinstance(cand_page.get("/Resources"), pikepdf.Dictionary):
+            cand_res = cand_page.get("/Resources")
+        else:
+            inherited = _get_page_resources_dict(cand_page)
+            cand_res = pikepdf.Dictionary(inherited) if isinstance(inherited, pikepdf.Dictionary) else pikepdf.Dictionary()
+            cand_page["/Resources"] = cand_res
+
+        for res_key, names in refs_by_type.items():
+            prev_sub = prev_res.get(res_key, None)
+            if not isinstance(prev_sub, pikepdf.Dictionary):
+                return False
+
+            cand_sub = cand_res.get(res_key, None)
+            if not isinstance(cand_sub, pikepdf.Dictionary):
+                cand_sub = pikepdf.Dictionary()
+                cand_res[res_key] = cand_sub
+
+            for name in sorted(names):
+                key = pikepdf.Name("/" + name)
+                if key in cand_sub:
+                    continue  # 已存在，无需注入
+                prev_obj = prev_sub.get(key, None)
+                if prev_obj is None:
+                    return False
+                cand_sub[key] = cand_pdf.copy_foreign(prev_obj)
+
+        return True
+    except:
+        return False
+
+
 def rollback_worse_content_streams(
     prev_pdf,
     cand_pdf,
@@ -416,8 +488,9 @@ def rollback_worse_content_streams(
         返回: (ok, rolled_stream_count, affected_page_count)
 
         safe_resource_check:
-        - True: 回退前校验 prev 流中的 `/<name> gs` 引用在 cand 页面的
-            /Resources/ExtGState 中全部可解析；否则跳过该流，避免透明度等图形状态丢失。
+        - True: 回退前校验 prev 流中引用的资源（ExtGState/XObject/ColorSpace）
+            在 cand 页面的 /Resources 中全部可解析；缺失时从 prev 页注入；
+            注入失败则跳过该流。
         - False: 不做该校验（不安全模式，仅用于对照实验）。
     """
     try:
@@ -449,21 +522,37 @@ def rollback_worse_content_streams(
                         if safe_resource_check:
                             try:
                                 cand_page = cand.pages[page_idx]
-                                refs = _extract_gs_refs_from_stream(prev_stream)
-                                if refs:
-                                    ext_keys = _get_page_extgstate_keys(cand_page)
-                                    missing_refs = set(refs) - set(ext_keys)
-                                    if missing_refs:
-                                        ok_alias = _inject_prev_extgstate_aliases(
-                                            prev.pages[page_idx], cand_page, missing_refs, cand
+                                all_refs = _extract_all_resource_refs(prev_stream)
+                                if all_refs:
+                                    # 检查所有资源类型，收集缺失项
+                                    cand_res = _get_page_resources_dict(cand_page)
+                                    missing_by_type = {}
+                                    for res_key, names in all_refs.items():
+                                        cand_sub = cand_res.get(res_key, None) if isinstance(cand_res, pikepdf.Dictionary) else None
+                                        existing = set()
+                                        if isinstance(cand_sub, pikepdf.Dictionary):
+                                            existing = set(str(k).lstrip("/") for k in cand_sub.keys())
+                                        missing = names - existing
+                                        if missing:
+                                            missing_by_type[res_key] = missing
+
+                                    if missing_by_type:
+                                        ok = _inject_missing_resources(
+                                            prev.pages[page_idx], cand_page, missing_by_type, cand
                                         )
-                                        if not ok_alias:
+                                        if not ok:
                                             continue
 
-                                    # 注入别名后再次确认引用可解析
-                                    ext_keys2 = _get_page_extgstate_keys(cand_page)
-                                    if not set(refs).issubset(set(ext_keys2)):
-                                        continue
+                                        # 注入后二次确认所有引用可解析
+                                        cand_res2 = _get_page_resources_dict(cand_page)
+                                        for res_key, names in all_refs.items():
+                                            cand_sub2 = cand_res2.get(res_key, None) if isinstance(cand_res2, pikepdf.Dictionary) else None
+                                            existing2 = set(str(k).lstrip("/") for k in cand_sub2.keys()) if isinstance(cand_sub2, pikepdf.Dictionary) else set()
+                                            if not names.issubset(existing2):
+                                                ok = False
+                                                break
+                                        if not ok:
+                                            continue
                             except:
                                 continue
                         try:
