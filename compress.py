@@ -2358,6 +2358,8 @@ def process_file(input_path, idx, total, unattended_mode=False):
         safe_print(f"      ║  [提醒] 请先确认这些页面是否确实适合灰度化：")
         safe_print(f"      ║         - 若文件已是清晰灰度稿，通常不必再次灰度化")
         safe_print(f"      ║         - 若需要保留专色/彩色信息，不建议强制灰度化")
+        safe_print(f"      ║         - 若文件含有矢量内容（如板写笔记、矢量绘图），不建议灰度化")
+        safe_print(f"      ║           灰度化会将矢量画面栅格化为位图，破坏矢量信息且无法还原")
         safe_print(f"      ║  [建议] 若文档为双色套印、以白底黑字为主，且文件体积较大（如 >100MB）的书籍扫描件，")
         safe_print(f"      ║         通常推荐灰度化以提升压缩收益。")
         safe_print(f"      ║         如不确定，建议先选 [4] 不执行灰度化，并人工抽检后再决定。")
