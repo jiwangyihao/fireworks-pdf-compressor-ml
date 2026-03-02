@@ -8,7 +8,7 @@ from libc.math cimport floor, log10, fabs, pow as cpow, sqrt as csqrt
 from cpython.bytes cimport PyBytes_FromStringAndSize
 from libc.string cimport memcpy
 
-CURVE_SIMPLIFY_THRESHOLD = 0.20
+CURVE_SIMPLIFY_THRESHOLD = 0.10
 
 NUM_RE = rb"[-+]?(?:\d*\.\d+|\d+)"
 L_PATTERN = re.compile(rb"(" + NUM_RE + rb")(\s+)(" + NUM_RE + rb")(\s+)(l)(?=\s|$)")
@@ -407,7 +407,7 @@ cdef inline double _parse_double(const char* src, Py_ssize_t start, Py_ssize_t e
     return strtod(buf, &endptr)
 
 
-def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart_c=False, double curve_threshold=0.20):
+def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart_c=False, double curve_threshold=0.10):
     cdef Py_ssize_t n = len(raw_data)
     cdef const char* src = raw_data
     cdef char* dst = <char*>malloc(n + 1)
@@ -428,7 +428,8 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
     cdef double cur_x = 0.0, cur_y = 0.0
     cdef double subpath_x = 0.0, subpath_y = 0.0
     cdef double cp1x, cp1y, cp2x, cp2y, epx, epy
-    cdef double dx, dy, line_len_sq, line_len, cross1, cross2, dist1, dist2, max_dist
+    cdef double dx, dy, line_len_sq, line_len, cross1, cross2, dist1, dist2, max_dist, rel_dist
+    cdef double REL_THRESHOLD = 0.10
 
     if dst == NULL:
         return raw_data
@@ -462,15 +463,18 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
                     if line_len_sq < 1e-12:
                         dist1 = csqrt((cp1x - cur_x) * (cp1x - cur_x) + (cp1y - cur_y) * (cp1y - cur_y))
                         dist2 = csqrt((cp2x - cur_x) * (cp2x - cur_x) + (cp2y - cur_y) * (cp2y - cur_y))
+                        max_dist = dist1 if dist1 > dist2 else dist2
+                        rel_dist = 999.0  # 零长弦不简化
                     else:
                         line_len = csqrt(line_len_sq)
                         cross1 = (cp1x - cur_x) * dy - (cp1y - cur_y) * dx
                         cross2 = (cp2x - cur_x) * dy - (cp2y - cur_y) * dx
                         dist1 = fabs(cross1) / line_len
                         dist2 = fabs(cross2) / line_len
-                    max_dist = dist1 if dist1 > dist2 else dist2
+                        max_dist = dist1 if dist1 > dist2 else dist2
+                        rel_dist = max_dist / line_len
 
-                    if max_dist < curve_threshold:
+                    if max_dist < curve_threshold and rel_dist < REL_THRESHOLD:
                         # c → l 简化: 只输出 x3 y3 l
                         out_len = _format_shorter(src, ns[4], ne[4], sig_figs, fmtbuf)
                         if out_len > 0:

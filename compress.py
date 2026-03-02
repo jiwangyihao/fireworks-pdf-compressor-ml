@@ -108,7 +108,7 @@ except AttributeError:
 SIZE_THRESHOLD_MB = 100
 MIN_IMAGE_SIZE = 2048
 CHUNK_SIZE = 20
-CURVE_SIMPLIFY_THRESHOLD = 0.20
+CURVE_SIMPLIFY_THRESHOLD = 0.10
 CPU_CORES = max(1, multiprocessing.cpu_count() - 1)
 
 # JPEG2000 编码并行策略 (imagecodecs + OpenJPEG)
@@ -2615,13 +2615,13 @@ def process_file(input_path, idx, total, unattended_mode=False):
         ("V", (4, False), "矢量 L1", ".tmp_v1"),
         ("I", (50,), "图片 50dB", ".tmp_i50"),
         ("T", (50,), "切片 50dB", ".tmp_t50"),
-        ("V", (3, False), "矢量 L2", ".tmp_v2"),
+        ("V", (3, True), "矢量 L2", ".tmp_v2"),
         ("I", (45,), "图片 45dB", ".tmp_i45"),
         ("T", (45,), "切片 45dB", ".tmp_t45"),
         ("V", (2, False), "矢量 L3", ".tmp_v3"),
         ("I", (40,), "图片 40dB", ".tmp_i40"),
         ("T", (40,), "切片 40dB", ".tmp_t40"),
-        ("V", (2, True), "矢量 L4", ".tmp_v4"),
+        ("V", (2, False), "矢量 L4", ".tmp_v4"),
         ("I", (35,), "图片 35dB", ".tmp_i35"),
         ("T", (35,), "切片 35dB", ".tmp_t35"),
     ]
