@@ -32,8 +32,6 @@ hiddenimports = [
     'imagecodecs._shared',
     'imagecodecs._shared_cython',
     'vector_hotspot_cython_nogil',
-    'deflate',
-    'deflate._deflate',
 ]
 
 # 收集 onnxruntime-directml DLL 路径 (DirectML.dll等)

@@ -3,7 +3,6 @@ import re
 import threading
 
 import pikepdf
-import deflate
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -12,7 +11,7 @@ from config import (
     VECTOR_SPLIT_THRESHOLD_BYTES, VECTOR_CHUNK_TARGET_BYTES,
     VECTOR_INNER_WORKERS, REGEX_STREAM_WORKERS,
 )
-from utils import safe_print, is_valid_pdf, libdeflate_compress_pdf
+from utils import safe_print, is_valid_pdf, libdeflate_compress_pdf, zlib_compress
 
 
 # Regex Utils
@@ -350,7 +349,7 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         # Phase 3: 单次 open，写回优化结果 (libdeflate 预压缩)
         with pikepdf.open(input_path) as pdf:
             for xref, data in all_results.items():
-                compressed = bytes(deflate.zlib_compress(data, LIBDEFLATE_LEVEL))
+                compressed = zlib_compress(data, LIBDEFLATE_LEVEL)
                 pdf.objects[xref].write(compressed, filter=pikepdf.Name("/FlateDecode"))
             pdf.remove_unreferenced_resources()
             libdeflate_compress_pdf(pdf)

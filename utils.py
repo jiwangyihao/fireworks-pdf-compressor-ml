@@ -1,10 +1,10 @@
 """通用工具函数 (无业务逻辑依赖)"""
 import os
+import zlib
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
 
 import pikepdf
-import deflate
 from tqdm import tqdm
 
 from config import LIBDEFLATE_LEVEL
@@ -99,6 +99,13 @@ def _compress_one_stream(args):
         if len(new_compressed) < len(raw):
             return new_compressed, len(raw) - len(new_compressed)
     return None, 0
+
+
+def zlib_compress(data, level=LIBDEFLATE_LEVEL):
+    """统一压缩接口：ctypes libdeflate > stdlib zlib。"""
+    if _init_ctypes_libdeflate():
+        return _ctypes_zlib_compress(data, level)
+    return zlib.compress(data, min(level, 9))
 
 
 def safe_print(msg):
@@ -237,7 +244,7 @@ def _libdeflate_compress_sequential(candidates, level):
             if filt == pikepdf.Name("/FlateDecode"):
                 raw = obj.read_bytes()
                 old_size = len(obj.read_raw_bytes())
-                new_compressed = bytes(deflate.zlib_compress(raw, level))
+                new_compressed = zlib_compress(raw, level)
                 if len(new_compressed) < old_size:
                     obj.write(new_compressed, filter=pikepdf.Name("/FlateDecode"))
                     improved += 1
@@ -246,7 +253,7 @@ def _libdeflate_compress_sequential(candidates, level):
                 raw = obj.read_bytes()
                 if len(raw) < 64:
                     continue
-                new_compressed = bytes(deflate.zlib_compress(raw, level))
+                new_compressed = zlib_compress(raw, level)
                 if len(new_compressed) < len(raw):
                     obj.write(new_compressed, filter=pikepdf.Name("/FlateDecode"))
                     improved += 1

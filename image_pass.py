@@ -4,7 +4,6 @@ import shutil
 import pikepdf
 import fitz  # PyMuPDF
 import numpy as np
-import deflate
 import imagecodecs
 from PIL import Image
 from tqdm import tqdm
@@ -14,7 +13,7 @@ from config import (
     GRID_SIZE, COLOR_STD_THRESHOLD, BINARIZE_THRESHOLD,
     LIBDEFLATE_LEVEL, JP2K_THREADS, JP2K_WORKERS, MIN_IMAGE_SIZE,
 )
-from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf
+from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf, zlib_compress
 from tiling_pass import detect_strict_color, detect_mono_or_hybrid
 
 
@@ -199,7 +198,7 @@ def _compress_single_xref(pdf, xref, target_quality, mixed_page_xrefs):
             # 使用 libdeflate 压缩原始 1-bit 数据 (替代 zlib level 9)
             # PIL tobytes("raw") 对于 mode "1" 返回 packed bits (每行 byte 对齐)，符合 PDF 要求
             raw_bits = img_bin.tobytes()
-            new_data = bytes(deflate.zlib_compress(raw_bits, LIBDEFLATE_LEVEL))
+            new_data = zlib_compress(raw_bits, LIBDEFLATE_LEVEL)
 
             if len(new_data) >= len(image_obj.read_raw_bytes()):
                 return None
@@ -320,7 +319,7 @@ def _encode_single_image(xref, pil_image, orig_raw_size, target_quality, mixed_p
                 lambda x: 0 if x < BINARIZE_THRESHOLD else 255, "1"
             )
             raw_bits = img_bin.tobytes()
-            new_data = bytes(deflate.zlib_compress(raw_bits, LIBDEFLATE_LEVEL))
+            new_data = zlib_compress(raw_bits, LIBDEFLATE_LEVEL)
             if len(new_data) >= orig_raw_size:
                 return None
             return {
