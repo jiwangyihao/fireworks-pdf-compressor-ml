@@ -12,7 +12,7 @@ from config import (
     VECTOR_SPLIT_THRESHOLD_BYTES, VECTOR_CHUNK_TARGET_BYTES,
     VECTOR_INNER_WORKERS, REGEX_STREAM_WORKERS,
 )
-from utils import safe_print, is_valid_pdf, _recompress_streams_libdeflate
+from utils import safe_print, is_valid_pdf, libdeflate_compress_pdf
 
 
 # Regex Utils
@@ -353,12 +353,12 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
                 compressed = bytes(deflate.zlib_compress(data, LIBDEFLATE_LEVEL))
                 pdf.objects[xref].write(compressed, filter=pikepdf.Name("/FlateDecode"))
             pdf.remove_unreferenced_resources()
+            libdeflate_compress_pdf(pdf)
             pdf.save(
                 output_path,
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
-        _recompress_streams_libdeflate(output_path)
         return is_valid_pdf(output_path)
     except:
         return False

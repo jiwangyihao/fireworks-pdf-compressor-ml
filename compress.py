@@ -15,11 +15,11 @@ from config import (
     check_ml_pipeline_available, SIZE_THRESHOLD_MB,
 )
 from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate
-from gs_pass import surgical_clean, run_gs_level0
+from gs_pass import surgical_clean, run_gs_level0, rollback_worse_content_streams
 from vector_pass import run_regex_pass
 from tiling_pass import run_tiling_pass
 from image_pass import (
-    rollback_worse_pages_by_image_payload, rollback_worse_content_streams,
+    rollback_worse_pages_by_image_payload,
     run_image_pass_safe,
 )
 from grayscale import (
