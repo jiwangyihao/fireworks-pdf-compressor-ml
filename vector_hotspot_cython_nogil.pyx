@@ -430,6 +430,15 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
     cdef double cp1x, cp1y, cp2x, cp2y, epx, epy
     cdef double dx, dy, line_len_sq, line_len, cross1, cross2, dist1, dist2, max_dist, rel_dist
     cdef double REL_THRESHOLD = 0.10
+    # 共线 l-segment 合并 (阈值 = 1.5×c→l阈值, 因为已线性化段的合并破坏性更低)
+    cdef double merge_threshold = curve_threshold * 1.5
+    cdef bint has_pending_l = False
+    cdef Py_ssize_t pending_l_w_start = 0
+    cdef double pre_l_x = 0.0, pre_l_y = 0.0
+    cdef double pending_l_x = 0.0, pending_l_y = 0.0
+    cdef double new_lx, new_ly
+    cdef double merge_dx, merge_dy, merge_ll_sq, merge_ll, merge_cross, merge_dist
+    cdef bint is_l_cmd
 
     if dst == NULL:
         return raw_data
@@ -441,6 +450,9 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
                 if enable_smart_c and src[i] == c'h':
                     cur_x = subpath_x
                     cur_y = subpath_y
+                # 非数字字符打断 l 链 (仅非空白字符)
+                if enable_smart_c and not _is_space(src[i]):
+                    has_pending_l = False
                 dst[w] = src[i]
                 w += 1
                 i += 1
@@ -475,7 +487,27 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
                         rel_dist = max_dist / line_len
 
                     if max_dist < curve_threshold and rel_dist < REL_THRESHOLD:
-                        # c → l 简化: 只输出 x3 y3 l
+                        # c → l 简化: 共线合并检查
+                        if has_pending_l:
+                            merge_dx = epx - pre_l_x
+                            merge_dy = epy - pre_l_y
+                            merge_ll_sq = merge_dx * merge_dx + merge_dy * merge_dy
+                            if merge_ll_sq > 1e-12:
+                                merge_ll = csqrt(merge_ll_sq)
+                                merge_cross = fabs((pending_l_x - pre_l_x) * merge_dy - (pending_l_y - pre_l_y) * merge_dx)
+                                merge_dist = merge_cross / merge_ll
+                                if merge_dist < merge_threshold:
+                                    w = pending_l_w_start
+                                else:
+                                    pre_l_x = pending_l_x
+                                    pre_l_y = pending_l_y
+                            else:
+                                w = pending_l_w_start
+                        else:
+                            pre_l_x = cur_x
+                            pre_l_y = cur_y
+                        pending_l_w_start = w
+                        # 只输出 x3 y3 l
                         out_len = _format_shorter(src, ns[4], ne[4], sig_figs, fmtbuf)
                         if out_len > 0:
                             memcpy(dst + w, fmtbuf, out_len)
@@ -496,11 +528,15 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
                         w += 1
                         dst[w] = c'l'
                         w += 1
+                        pending_l_x = epx
+                        pending_l_y = epy
+                        has_pending_l = True
                         cur_x = epx
                         cur_y = epy
                         i = op_pos[0] + 1
                         continue
-                    # 未简化, 更新当前点后正常输出
+                    # 未简化, c 命令打断 l 链
+                    has_pending_l = False
                     cur_x = epx
                     cur_y = epy
                 # 正常输出 c 命令的 6 个参数
@@ -529,11 +565,41 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
             elif _match_cmd(src, i, n, 1, c'w', c'w', &ns[0], &ne[0], &ws_s[0], &ws_e[0], &op_pos[0]):
                 k = 1
             else:
+                if enable_smart_c:
+                    has_pending_l = False
                 ne[0] = _parse_num_end(src, i, n)
                 memcpy(dst + w, src + i, ne[0] - i)
                 w += (ne[0] - i)
                 i = ne[0]
                 continue
+
+            # 共线 l 段合并: 检查是否为 l 命令
+            is_l_cmd = (k == 2 and src[op_pos[0]] == c'l')
+            if enable_smart_c:
+                if is_l_cmd:
+                    new_lx = _parse_double(src, ns[0], ne[0], numbuf_tmp)
+                    new_ly = _parse_double(src, ns[1], ne[1], numbuf_tmp)
+                    if has_pending_l:
+                        merge_dx = new_lx - pre_l_x
+                        merge_dy = new_ly - pre_l_y
+                        merge_ll_sq = merge_dx * merge_dx + merge_dy * merge_dy
+                        if merge_ll_sq > 1e-12:
+                            merge_ll = csqrt(merge_ll_sq)
+                            merge_cross = fabs((pending_l_x - pre_l_x) * merge_dy - (pending_l_y - pre_l_y) * merge_dx)
+                            merge_dist = merge_cross / merge_ll
+                            if merge_dist < merge_threshold:
+                                w = pending_l_w_start
+                            else:
+                                pre_l_x = pending_l_x
+                                pre_l_y = pending_l_y
+                        else:
+                            w = pending_l_w_start
+                    else:
+                        pre_l_x = cur_x
+                        pre_l_y = cur_y
+                    pending_l_w_start = w
+                else:
+                    has_pending_l = False
 
             # 正常输出 v/y, m/l, w 命令
             for idx in range(k):
@@ -548,6 +614,12 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
                 w += (ws_e[idx] - ws_s[idx])
             dst[w] = src[op_pos[0]]
             w += 1
+
+            # l 命令后更新 pending 状态
+            if enable_smart_c and is_l_cmd:
+                pending_l_x = new_lx
+                pending_l_y = new_ly
+                has_pending_l = True
 
             # 追踪当前点 (m/l: 最后2参数, v/y: 最后2参数)
             if enable_smart_c and k >= 2:
