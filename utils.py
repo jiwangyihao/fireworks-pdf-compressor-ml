@@ -71,7 +71,7 @@ def _recompress_streams_libdeflate(pdf_path, level=LIBDEFLATE_LEVEL):
                 return
             improved = 0
             saved_bytes = 0
-            pbar = tqdm(candidates, desc="      🔧 libdeflate", unit="stream", leave=False)
+            pbar = tqdm(candidates, desc="      🔧 libdeflate", unit="stream", leave=True)
             for obj in pbar:
                 filt = obj.get("/Filter")
                 try:

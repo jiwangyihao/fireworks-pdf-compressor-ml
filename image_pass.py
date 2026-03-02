@@ -53,7 +53,7 @@ def _estimate_page_image_payloads(pdf_path):
     return payloads
 
 
-def rollback_worse_pages_by_image_payload(prev_pdf, cand_pdf, out_pdf, tolerance_bytes=0, max_rounds=3):
+def rollback_worse_pages_by_image_payload(prev_pdf, cand_pdf, out_pdf, tolerance_bytes=0, max_rounds=3, skip_recompress=False):
     """将候选文件中"图像载荷变大"的页面回退为上一阶段页面（迭代收敛版）。
 
     说明：
@@ -102,7 +102,8 @@ def rollback_worse_pages_by_image_payload(prev_pdf, cand_pdf, out_pdf, tolerance
             cand_doc.save(round_out, garbage=4, deflate=True)
             cand_doc.close()
             prev_doc.close()
-            _recompress_streams_libdeflate(round_out)
+            if not skip_recompress:
+                _recompress_streams_libdeflate(round_out)
 
             current_input = round_out
 
@@ -339,6 +340,7 @@ def rollback_worse_content_streams(
     out_pdf,
     tolerance_bytes=64,
     safe_resource_check=True,
+    skip_recompress=False,
 ):
     """流级内容回退：仅回退相对上一阶段"明显变大"的内容流。
 
@@ -441,7 +443,8 @@ def rollback_worse_content_streams(
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
 
-        _recompress_streams_libdeflate(out_pdf)
+        if not skip_recompress:
+            _recompress_streams_libdeflate(out_pdf)
         return is_valid_pdf(out_pdf), rolled_streams, len(affected_pages)
     except:
         return False, 0, 0

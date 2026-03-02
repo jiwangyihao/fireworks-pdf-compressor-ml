@@ -91,26 +91,33 @@ def process_file(input_path, idx, total, unattended_mode=False):
                     keep_gs = False
             
             if keep_gs:
-                # GS 页面级回退：先回退“相对上一阶段变大”的页面，再决定是否采用
+                # GS 回退：先流级回退，再页级回退，两轮结束后统一 libdeflate
                 gs_candidate = tmp_gs
-                gs_guard_file = tmp_gs + ".tmp_guard_prev"
-                gs_guard_ok, gs_worse_cnt = rollback_worse_pages_by_image_payload(
-                    current_file, tmp_gs, gs_guard_file
-                )
-                if gs_guard_ok and is_valid_pdf(gs_guard_file):
-                    gs_candidate = gs_guard_file
-                    safe_print(f"      [GUARD] GS 页级回退(迭代): 回退 {gs_worse_cnt} 页")
 
-                # GS 内容流级回退：容忍轻微编码差异，仅回退“明显变大”的内容流
+                # 1) 流级内容回退（先于页级）
                 gs_content_guard_file = tmp_gs + ".tmp_guard_content"
                 content_guard_ok, rolled_streams, affected_pages = rollback_worse_content_streams(
-                    current_file, gs_candidate, gs_content_guard_file, tolerance_bytes=64
+                    current_file, gs_candidate, gs_content_guard_file, tolerance_bytes=64,
+                    skip_recompress=True,
                 )
                 if content_guard_ok and is_valid_pdf(gs_content_guard_file):
                     gs_candidate = gs_content_guard_file
                     safe_print(
                         f"      [GUARD] GS 流级内容回退: 回退 {rolled_streams} 条流 / {affected_pages} 页"
                     )
+
+                # 2) 页级回退（后于流级）
+                gs_guard_file = tmp_gs + ".tmp_guard_prev"
+                gs_guard_ok, gs_worse_cnt = rollback_worse_pages_by_image_payload(
+                    current_file, gs_candidate, gs_guard_file,
+                    skip_recompress=True,
+                )
+                if gs_guard_ok and is_valid_pdf(gs_guard_file):
+                    gs_candidate = gs_guard_file
+                    safe_print(f"      [GUARD] GS 页级回退(迭代): 回退 {gs_worse_cnt} 页")
+
+                # 3) 两轮回退结束后统一 libdeflate 重压缩
+                _recompress_streams_libdeflate(gs_candidate)
 
                 # 严格相对上一阶段回退：守卫后仍不变小则不采用
                 gs_mb = get_file_mb(gs_candidate)
