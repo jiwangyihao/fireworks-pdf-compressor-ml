@@ -32,6 +32,8 @@ hiddenimports = [
     'imagecodecs._shared',
     'imagecodecs._shared_cython',
     'vector_hotspot_cython_nogil',
+    'deflate',
+    'deflate._deflate',
 ]
 
 # 收集 onnxruntime-directml DLL 路径 (DirectML.dll等)
@@ -58,7 +60,7 @@ if not _cython_ext_binaries:
 a = Analysis(
     ['compress.py'],
     pathex=[],
-    binaries=_ort_binaries + _cython_ext_binaries,
+    binaries=_ort_binaries + _cython_ext_binaries + [('deflate.dll', '.')],
     datas=[
         # 模型文件 (FP16 ONNX，体积减半，速度提升~40%)
         ('models/real-esrgan-x4plus-128-fp16.onnx', 'models'),
@@ -74,6 +76,14 @@ a = Analysis(
         ('ml_pipeline.py', '.'),
         # 自适应配置
         ('adaptive_config.py', '.'),
+        # 重构后的模块
+        ('config.py', '.'),
+        ('utils.py', '.'),
+        ('gs_pass.py', '.'),
+        ('vector_pass.py', '.'),
+        ('tiling_pass.py', '.'),
+        ('image_pass.py', '.'),
+        ('grayscale.py', '.'),
         # Ghostscript (如果需要)
         ('gs', 'gs'),
     ],
