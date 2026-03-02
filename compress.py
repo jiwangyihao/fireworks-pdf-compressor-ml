@@ -8,6 +8,7 @@ import subprocess
 import multiprocessing
 import threading
 import zlib  # Added for Flate compression
+import deflate  # libdeflate: faster + better zlib-compatible compression
 import importlib
 from pathlib import Path
 
@@ -125,6 +126,7 @@ BLOCK_GRAY_PIXEL_THRESHOLD = 0.15
 GRAY_LOWER_BOUND = 50
 GRAY_UPPER_BOUND = 220
 BINARIZE_THRESHOLD = 180
+LIBDEFLATE_LEVEL = 12  # libdeflate max compression level (replaces zlib level 9)
 TILE_GRID_ROWS = 5
 TILE_GRID_COLS = 5
 TILE_CHECK_GRID = 4
@@ -135,6 +137,68 @@ lossy_report_list = []
 large_file_report_list = []
 
 # === 安全打印函数 (避免 Windows GBK 编码问题) ===
+def _recompress_streams_libdeflate(pdf_path, level=LIBDEFLATE_LEVEL):
+    """用 libdeflate 压缩/重压缩 PDF 中所有内容流，完全替代 zlib。
+
+    处理两类流：
+    1. FlateDecode 流 → 解压后用 libdeflate 重压缩（仅更小时替换）
+    2. 无滤镜流 → 用 libdeflate 压缩（仅更小时应用）
+    跳过 DCTDecode/JPXDecode/CCITTFaxDecode 等专用编码。
+    """
+    _SKIP_FILTERS = {
+        pikepdf.Name("/DCTDecode"), pikepdf.Name("/JPXDecode"),
+        pikepdf.Name("/CCITTFaxDecode"), pikepdf.Name("/JBIG2Decode"),
+        pikepdf.Name("/LZWDecode"), pikepdf.Name("/Crypt"),
+    }
+    try:
+        with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+            # 先收集需要处理的流对象
+            candidates = []
+            for obj in pdf.objects:
+                if not isinstance(obj, pikepdf.Stream):
+                    continue
+                filt = obj.get("/Filter")
+                if isinstance(filt, pikepdf.Array):
+                    continue
+                if filt in _SKIP_FILTERS:
+                    continue
+                if filt == pikepdf.Name("/FlateDecode") or filt is None:
+                    candidates.append(obj)
+            if not candidates:
+                return
+            improved = 0
+            saved_bytes = 0
+            pbar = tqdm(candidates, desc="      🔧 libdeflate", unit="stream", leave=False)
+            for obj in pbar:
+                filt = obj.get("/Filter")
+                try:
+                    if filt == pikepdf.Name("/FlateDecode"):
+                        raw = obj.read_bytes()
+                        old_size = len(obj.read_raw_bytes())
+                        new_compressed = bytes(deflate.zlib_compress(raw, level))
+                        if len(new_compressed) < old_size:
+                            obj.write(new_compressed, filter=pikepdf.Name("/FlateDecode"))
+                            improved += 1
+                            saved_bytes += old_size - len(new_compressed)
+                    elif filt is None:
+                        raw = obj.read_bytes()
+                        if len(raw) < 64:
+                            continue
+                        new_compressed = bytes(deflate.zlib_compress(raw, level))
+                        if len(new_compressed) < len(raw):
+                            obj.write(new_compressed, filter=pikepdf.Name("/FlateDecode"))
+                            improved += 1
+                            saved_bytes += len(raw) - len(new_compressed)
+                except Exception:
+                    continue
+                pbar.set_postfix(improved=improved, saved=f"{saved_bytes/1024:.0f}KB")
+            pbar.close()
+            if improved > 0:
+                pdf.save(pdf_path)
+    except Exception:
+        pass
+
+
 def safe_print(msg):
     """安全打印，处理 Windows 控制台的编码问题"""
     try:
@@ -242,6 +306,7 @@ def rollback_worse_pages_by_image_payload(prev_pdf, cand_pdf, out_pdf, tolerance
             cand_doc.save(round_out, garbage=4, deflate=True)
             cand_doc.close()
             prev_doc.close()
+            _recompress_streams_libdeflate(round_out)
 
             current_input = round_out
 
@@ -580,6 +645,7 @@ def rollback_worse_content_streams(
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
 
+        _recompress_streams_libdeflate(out_pdf)
         return is_valid_pdf(out_pdf), rolled_streams, len(affected_pages)
     except:
         return False, 0, 0
@@ -955,6 +1021,7 @@ def convert_pages_to_grayscale(input_path, output_path, page_indices, dpi=150, e
         if converted_count > 0:
             doc.save(output_path, garbage=4, deflate=True)
             doc.close()
+            _recompress_streams_libdeflate(output_path)
             return is_valid_pdf(output_path)
         else:
             doc.close()
@@ -1288,6 +1355,7 @@ def surgical_clean(input_path, output_path):
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
+        _recompress_streams_libdeflate(output_path)
         return is_valid_pdf(output_path)
     except:
         return False
@@ -1703,16 +1771,18 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         if not all_results:
             return False
 
-        # Phase 3: 单次 open，写回优化结果
+        # Phase 3: 单次 open，写回优化结果 (libdeflate 预压缩)
         with pikepdf.open(input_path) as pdf:
             for xref, data in all_results.items():
-                pdf.objects[xref].write(data)
+                compressed = bytes(deflate.zlib_compress(data, LIBDEFLATE_LEVEL))
+                pdf.objects[xref].write(compressed, filter=pikepdf.Name("/FlateDecode"))
             pdf.remove_unreferenced_resources()
             pdf.save(
                 output_path,
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
+        _recompress_streams_libdeflate(output_path)
         return is_valid_pdf(output_path)
     except:
         return False
@@ -1779,10 +1849,10 @@ def _compress_single_xref(pdf, xref, target_quality, mixed_page_xrefs):
                 lambda x: 0 if x < BINARIZE_THRESHOLD else 255, "1"
             )
 
-            # 使用 Flate (Zlib) 压缩原始 1-bit 数据
+            # 使用 libdeflate 压缩原始 1-bit 数据 (替代 zlib level 9)
             # PIL tobytes("raw") 对于 mode "1" 返回 packed bits (每行 byte 对齐)，符合 PDF 要求
             raw_bits = img_bin.tobytes()
-            new_data = zlib.compress(raw_bits, level=9)
+            new_data = bytes(deflate.zlib_compress(raw_bits, LIBDEFLATE_LEVEL))
 
             if len(new_data) >= len(image_obj.read_raw_bytes()):
                 return None
@@ -1903,7 +1973,7 @@ def _encode_single_image(xref, pil_image, orig_raw_size, target_quality, mixed_p
                 lambda x: 0 if x < BINARIZE_THRESHOLD else 255, "1"
             )
             raw_bits = img_bin.tobytes()
-            new_data = zlib.compress(raw_bits, level=9)
+            new_data = bytes(deflate.zlib_compress(raw_bits, LIBDEFLATE_LEVEL))
             if len(new_data) >= orig_raw_size:
                 return None
             return {
@@ -2091,6 +2161,7 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                         del obj["/ICCProfile"]  # type: ignore
                 pdf.remove_unreferenced_resources()
                 pdf.save(output_path, compress_streams=True)
+            _recompress_streams_libdeflate(output_path)
             return is_valid_pdf(output_path)
         except:
             return False
@@ -2248,6 +2319,7 @@ def process_page_chunk_tiling(input_path, start_page, end_page, chunk_id, target
     # 降低垃圾回收级别，避免在 Chunk 阶段破坏引用
     new_doc.save(chunk_output, garbage=0, deflate=True)
     new_doc.close()
+    _recompress_streams_libdeflate(chunk_output)
     return chunk_output, chunk_stats
 
 
@@ -2330,6 +2402,7 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
 
     final_doc.save(output_path, garbage=4, deflate=True)
     final_doc.close()
+    _recompress_streams_libdeflate(output_path)
 
     for cf in chunk_files:
         os.remove(cf)
@@ -2378,6 +2451,7 @@ def process_file(input_path, idx, total, unattended_mode=False):
     # === 修复逻辑：尝试运行 GS，但如果结果损坏或文字乱码，自动回退 ===
     gs_success = run_gs_level0(current_file, tmp_gs, total_pages)
     if gs_success:
+        _recompress_streams_libdeflate(tmp_gs)
         prev_mb_before_gs = get_file_mb(current_file)
         # 验证 GS 结果是否损坏 (MuPDF check)
         try:
@@ -2736,12 +2810,16 @@ def main():
     except Exception:
         safe_print("  [GPU] ML模块未加载，GPU检测跳过")
 
-    pdf_files = [
-        os.path.join(r, f)
-        for r, d, fs in os.walk(".")
-        for f in fs
-        if f.lower().endswith(".pdf") and "_opted" not in f and ".tmp" not in f
-    ]
+    # 支持命令行指定文件: python compress.py file1.pdf file2.pdf ...
+    if len(sys.argv) > 1:
+        pdf_files = [p for p in sys.argv[1:] if os.path.isfile(p) and p.lower().endswith(".pdf")]
+    else:
+        pdf_files = [
+            os.path.join(r, f)
+            for r, d, fs in os.walk(".")
+            for f in fs
+            if f.lower().endswith(".pdf") and "_opted" not in f and ".tmp" not in f
+        ]
 
     global lossy_report_list, large_file_report_list
     lossy_report_list = []
