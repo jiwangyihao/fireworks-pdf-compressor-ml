@@ -17,6 +17,9 @@ from config import (
 )
 from utils import safe_print, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, tlog
 
+# 纯图片页面缓存: 首次扫描后记录哪些页是纯图片页（无文字无绘图），后续调用直接复用
+_pure_image_pages_cache = None  # None=未扫描, set()=已扫描
+
 
 # ============================
 # 灰度/色彩 严格检测逻辑
@@ -327,12 +330,27 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
     except Exception:
         pass
 
+    global _pure_image_pages_cache
+
     candidates = []  # [(page_idx, [(xref, pil_img, target_rect, orig_len, coverage, all_rects)])]
     doc = fitz.open(input_path)
     tlog(f"T({desc}): Phase1 fitz.open 完成, {len(doc)} 页")
     total_pages = len(doc)
 
-    for page_idx in range(total_pages):
+    # 缓存命中: 直接跳过非纯图片页
+    if _pure_image_pages_cache is not None:
+        scan_pages = _pure_image_pages_cache
+        tlog(f"T({desc}): Phase1 使用缓存, {len(scan_pages)} 纯图片页")
+        if not scan_pages:
+            doc.close()
+            tlog(f"T({desc}): Phase1 缓存为空, 跳过")
+            return False
+    else:
+        scan_pages = range(total_pages)
+
+    pure_image_page_indices = set()
+
+    for page_idx in scan_pages:
         page = doc[page_idx]
 
         img_list = page.get_images(full=True)
@@ -344,6 +362,8 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
         has_drawings = len(page.get_drawings()) > 0
         if has_text or has_drawings:
             continue
+
+        pure_image_page_indices.add(page_idx)
 
         page_images = []
         for img_info in list(img_list):
@@ -379,6 +399,12 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
             candidates.append((page_idx, page_images))
 
     doc.close()
+
+    # 更新缓存
+    if _pure_image_pages_cache is None:
+        _pure_image_pages_cache = pure_image_page_indices
+        tlog(f"T({desc}): Phase1 缓存已建立, {len(pure_image_page_indices)} 纯图片页")
+
     tlog(f"T({desc}): Phase1 提取完成, {len(candidates)} 候选页")
 
     if not candidates:
