@@ -375,6 +375,7 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
         try:
             doc = fitz.open(input_path)
             total_pages_scanned = len(doc)
+            pbar = tqdm(total=total_pages_scanned, desc="      📄 页面预扫描", unit="页")
             for page_idx, page in enumerate(doc):
                 has_text = len(page.get_text("text").strip()) > 0
                 # get_drawings() 开销较大；有文字时已可判定为混合页，直接短路。
@@ -383,6 +384,8 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     has_drawings = len(page.get_drawings()) > 0
                 if has_text or has_drawings:
                     mixed_page_indices.add(page_idx)
+                pbar.update(1)
+            pbar.close()
             doc.close()
         except:
             mixed_page_indices = set()

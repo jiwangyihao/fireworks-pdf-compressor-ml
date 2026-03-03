@@ -208,6 +208,8 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
                     _stream_cache = None
 
             if not cache_hit:
+                total_objs = len(pdf.objects)
+                pbar_p1 = tqdm(total=total_objs, desc=f"      📦 {desc} 读取流", unit="obj")
                 for i, obj in enumerate(pdf.objects):
                     if isinstance(obj, pikepdf.Stream):
                         subtype = str(obj.get("/Subtype") or "")
@@ -218,6 +220,8 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
                                     candidate_raw[i] = raw
                             except:
                                 pass
+                    pbar_p1.update(1)
+                pbar_p1.close()
                 xref_list = list(candidate_raw.keys())
 
         if not candidate_raw:
