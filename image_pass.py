@@ -14,7 +14,7 @@ from config import (
     LIBDEFLATE_LEVEL, JP2K_THREADS, JP2K_WORKERS, MIN_IMAGE_SIZE,
 )
 from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, zlib_compress, tlog
-from tiling_pass import detect_strict_color, detect_mono_or_hybrid
+from tiling_pass import detect_strict_color, detect_mono_or_hybrid, set_pure_image_pages_cache
 
 # 混合页面索引缓存: 首次扫描后记录哪些页面是混合页面(有文字/绘图)
 # 页码索引是位置不变量，不受 pikepdf save 重编号 xref 的影响
@@ -371,8 +371,10 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
     if _mixed_page_indices_cache is None:
         # 首次调用：fitz 全量扫描，确定哪些页面是混合页面
         mixed_page_indices = set()
+        total_pages_scanned = 0
         try:
             doc = fitz.open(input_path)
+            total_pages_scanned = len(doc)
             for page_idx, page in enumerate(doc):
                 has_text = len(page.get_text("text").strip()) > 0
                 # get_drawings() 开销较大；有文字时已可判定为混合页，直接短路。
@@ -386,6 +388,10 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
             mixed_page_indices = set()
         _mixed_page_indices_cache = mixed_page_indices
         tlog(f"I({desc}): 页面索引缓存已建立, {len(mixed_page_indices)} 个混合页面")
+        # 派生纯图片页集合，共享给 tiling_pass 避免重复扫描
+        if total_pages_scanned > 0:
+            set_pure_image_pages_cache(set(range(total_pages_scanned)) - mixed_page_indices)
+            tlog(f"I({desc}): 已设置 tiling 纯图片页缓存, {total_pages_scanned - len(mixed_page_indices)} 页")
     else:
         tlog(f"I({desc}): 使用页面索引缓存, {len(_mixed_page_indices_cache)} 个混合页面")
 

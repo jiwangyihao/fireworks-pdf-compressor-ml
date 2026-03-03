@@ -21,6 +21,11 @@ from vector_pass import invalidate_stream_cache
 # 纯图片页面缓存: 首次扫描后记录哪些页是纯图片页（无文字无绘图），后续调用直接复用
 _pure_image_pages_cache = None  # None=未扫描, set()=已扫描
 
+def set_pure_image_pages_cache(pages_set):
+    """外部设置纯图片页面缓存（由 image_pass 预扫描后调用）"""
+    global _pure_image_pages_cache
+    _pure_image_pages_cache = pages_set
+
 
 # ============================
 # 灰度/色彩 严格检测逻辑
