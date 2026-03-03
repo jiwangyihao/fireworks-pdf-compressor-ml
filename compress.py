@@ -108,16 +108,19 @@ def process_file(input_path, idx, total, unattended_mode=False):
 
                 # 2) 页级回退（后于流级）
                 gs_guard_file = tmp_gs + ".tmp_guard_prev"
+                page_rollback_triggered = False
                 gs_guard_ok, gs_worse_cnt = rollback_worse_pages_by_image_payload(
                     current_file, gs_candidate, gs_guard_file,
                     skip_recompress=True,
                 )
                 if gs_guard_ok and is_valid_pdf(gs_guard_file):
                     gs_candidate = gs_guard_file
+                    page_rollback_triggered = True
                     safe_print(f"      [GUARD] GS 页级回退(迭代): 回退 {gs_worse_cnt} 页")
 
-                # 3) 两轮回退结束后统一 libdeflate 重压缩
-                _recompress_streams_libdeflate(gs_candidate)
+                # 3) 仅在 fitz 页级回退触发时需要重压缩 (fitz save 可能改变流压缩质量)
+                if page_rollback_triggered:
+                    _recompress_streams_libdeflate(gs_candidate)
 
                 # 严格相对上一阶段回退：守卫后仍不变小则不采用
                 gs_mb = get_file_mb(gs_candidate)

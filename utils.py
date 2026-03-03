@@ -252,6 +252,8 @@ def _libdeflate_compress_parallel(candidates, level):
 
     pbar.close()
 
+    tlog(f"libdeflate_compress_pdf: improved={improved}, saved={saved_bytes/1024:.0f}KB")
+
     # Phase 3: 写回压缩结果（主线程）
     for idx, compressed in results_map.items():
         candidates[idx].write(compressed, filter=pikepdf.Name("/FlateDecode"))
