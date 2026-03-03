@@ -514,7 +514,6 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     if "/ICCProfile" in obj:
                         del obj["/ICCProfile"]  # type: ignore
                 tlog(f"I({desc}): PhaseC write-back 完成")
-                pdf.remove_unreferenced_resources()
                 tlog(f"I({desc}): PhaseC libdeflate 开始")
                 libdeflate_compress_pdf(pdf)
                 tlog(f"I({desc}): PhaseC save 开始")

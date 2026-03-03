@@ -25,7 +25,6 @@ def surgical_clean(input_path, output_path):
                     del page["/PieceInfo"]  # type: ignore
                 if "/Thumb" in page:
                     del page["/Thumb"]  # type: ignore
-            pdf.remove_unreferenced_resources()
             tlog("GS: surgical_clean libdeflate 开始")
             libdeflate_compress_pdf(pdf)
             tlog("GS: surgical_clean save 开始")
