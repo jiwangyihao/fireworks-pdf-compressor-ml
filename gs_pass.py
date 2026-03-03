@@ -7,13 +7,15 @@ import subprocess
 import pikepdf
 from tqdm import tqdm
 
-from utils import safe_print, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf
+from utils import safe_print, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf, tlog
 
 
 def surgical_clean(input_path, output_path):
     print("      📋 正在执行清理...")
     try:
+        tlog("GS: surgical_clean pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
+            tlog("GS: surgical_clean pikepdf.open 完成")
             if "/PieceInfo" in pdf.Root:
                 del pdf.Root["/PieceInfo"]  # type: ignore
             if "/Metadata" in pdf.Root:
@@ -24,12 +26,15 @@ def surgical_clean(input_path, output_path):
                 if "/Thumb" in page:
                     del page["/Thumb"]  # type: ignore
             pdf.remove_unreferenced_resources()
+            tlog("GS: surgical_clean libdeflate 开始")
             libdeflate_compress_pdf(pdf)
+            tlog("GS: surgical_clean save 开始")
             pdf.save(
                 output_path,
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
+            tlog("GS: surgical_clean save 完成")
         return is_valid_pdf(output_path)
     except:
         return False
@@ -51,6 +56,7 @@ def run_gs_level0(input_path, output_path, total_pages=0):
     gs_exe = get_gs_path()
     if not gs_exe:
         return False
+    tlog("GS: run_gs_level0 subprocess 开始")
     cmd = [
         gs_exe,
         "-sDEVICE=pdfwrite",
@@ -99,6 +105,7 @@ def run_gs_level0(input_path, output_path, total_pages=0):
                         print(f"      [GS] {line.strip()}", end="\r")
 
         process.wait()
+        tlog(f"GS: run_gs_level0 subprocess 完成, returncode={process.returncode}")
         if pbar:
             pbar.close()
         return process.returncode == 0 and is_valid_pdf(output_path)
@@ -247,7 +254,9 @@ def rollback_worse_content_streams(
         rolled_streams = 0
         affected_pages = set()
 
+        tlog("GS: rollback pikepdf.open prev+cand 开始")
         with pikepdf.open(prev_pdf) as prev, pikepdf.open(cand_pdf) as cand:
+            tlog(f"GS: rollback pikepdf.open 完成, prev={len(prev.pages)}p cand={len(cand.pages)}p")
             if len(prev.pages) != len(cand.pages):
                 return False, 0, 0
 
@@ -324,13 +333,17 @@ def rollback_worse_content_streams(
             if rolled_streams <= 0:
                 return False, 0, 0
 
+            tlog(f"GS: rollback 完成, rolled={rolled_streams} pages={len(affected_pages)}")
             if not skip_recompress:
+                tlog("GS: rollback libdeflate 开始")
                 libdeflate_compress_pdf(cand)
+            tlog("GS: rollback save 开始")
             cand.save(
                 out_pdf,
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
+            tlog("GS: rollback save 完成")
 
         return is_valid_pdf(out_pdf), rolled_streams, len(affected_pages)
     except:

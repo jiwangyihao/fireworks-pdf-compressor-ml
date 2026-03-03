@@ -13,7 +13,7 @@ from config import (
     GRID_SIZE, COLOR_STD_THRESHOLD, BINARIZE_THRESHOLD,
     LIBDEFLATE_LEVEL, JP2K_THREADS, JP2K_WORKERS, MIN_IMAGE_SIZE,
 )
-from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf, zlib_compress
+from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf, zlib_compress, tlog
 from tiling_pass import detect_strict_color, detect_mono_or_hybrid
 
 
@@ -360,6 +360,7 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
 
     # 1. 预扫描：识别哪些 XREF 属于 "混合页面" (有文字/矢量)
     # 这些页面上的灰度图必须在安全图片压缩阶段处理，不能留给破坏性切片阶段
+    tlog(f"I({desc}): 预扫描混合页面开始")
     mixed_page_xrefs = set()
     try:
         doc = fitz.open(input_path)
@@ -378,13 +379,16 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
         doc.close()
     except:
         pass  # 如果扫描失败，mixed_page_xrefs 为空，灰度图将全部跳过给切片阶段 (风险较小)
+    tlog(f"I({desc}): 预扫描完成, mixed_page_xrefs={len(mixed_page_xrefs)}")
 
     # === Phase A: 单线程提取 (GIL-bound pikepdf) ===
     # 只打开PDF一次，提取所有图片为PIL对象 + 原始大小
+    tlog(f"I({desc}): PhaseA pikepdf.open 开始")
     extracted = []  # list of (xref, pil_image, orig_raw_size, is_dct_cmyk)
     trivial_smask_xrefs = set()  # 记录需要移除的全透明 SMask 图片 xref
     try:
         with pikepdf.open(input_path) as pdf:
+            tlog(f"I({desc}): PhaseA pikepdf.open 完成, 遍历对象")
             for i, obj in enumerate(pdf.objects):
                 if isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == "/Image":
                     raw_size = len(obj.read_raw_bytes())
@@ -423,10 +427,12 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                         continue
     except Exception:
         return False
+    tlog(f"I({desc}): PhaseA 提取完成, {len(extracted)} 张图片")
     if not extracted:
         return False
 
     # === Phase B: 多线程编码 (GIL-free numpy/PIL/zlib) ===
+    tlog(f"I({desc}): PhaseB 多线程编码开始, {len(extracted)} 任务")
     results = []
     opt_count = [0]
     pbar = tqdm(
@@ -464,9 +470,11 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
             if res is not None:
                 results.append(res)
     pbar.close()
+    tlog(f"I({desc}): PhaseB 编码完成, {len(results)} 结果")
 
     if results:
         try:
+            tlog(f"I({desc}): PhaseC pikepdf.open 开始")
             with pikepdf.open(input_path, allow_overwriting_input=True) as pdf:
                 for res in results:
                     obj = pdf.objects[res["xref"]]
@@ -505,9 +513,13 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                         del obj["/Decode"]  # type: ignore
                     if "/ICCProfile" in obj:
                         del obj["/ICCProfile"]  # type: ignore
+                tlog(f"I({desc}): PhaseC write-back 完成")
                 pdf.remove_unreferenced_resources()
+                tlog(f"I({desc}): PhaseC libdeflate 开始")
                 libdeflate_compress_pdf(pdf)
+                tlog(f"I({desc}): PhaseC save 开始")
                 pdf.save(output_path, compress_streams=True)
+                tlog(f"I({desc}): PhaseC save 完成")
             return is_valid_pdf(output_path)
         except:
             return False

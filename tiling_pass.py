@@ -15,7 +15,7 @@ from config import (
     TILE_GRID_ROWS, TILE_GRID_COLS, TILE_CHECK_GRID,
     JP2K_THREADS, JP2K_WORKERS, PDF_REDACT_IMAGE_REMOVE,
 )
-from utils import safe_print, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate
+from utils import safe_print, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, tlog
 
 
 # ============================
@@ -321,6 +321,7 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
     safe_print(f"      [TILE] {desc} (灰度切片/优化 {target_quality}dB)...")
 
     # ── Phase 1: 提取候选页面/图像数据 ──
+    tlog(f"T({desc}): Phase1 fitz.open 开始")
     try:
         fitz.tools.set_stderr_file("/dev/null")
     except Exception:
@@ -328,6 +329,7 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
 
     candidates = []  # [(page_idx, [(xref, pil_img, target_rect, orig_len, coverage, all_rects)])]
     doc = fitz.open(input_path)
+    tlog(f"T({desc}): Phase1 fitz.open 完成, {len(doc)} 页")
     total_pages = len(doc)
 
     for page_idx in range(total_pages):
@@ -377,11 +379,13 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
             candidates.append((page_idx, page_images))
 
     doc.close()
+    tlog(f"T({desc}): Phase1 提取完成, {len(candidates)} 候选页")
 
     if not candidates:
         return False
 
     # ── Phase 2: 多线程并行计算 (色彩检测 + 编码) ──
+    tlog(f"T({desc}): Phase2 多线程计算开始, {len(candidates)} 任务")
     all_modifications = {}  # page_idx → modifications
     total_stats = {"mono_tiles": 0, "hybrid_tiles": 0, "pages_modified": 0}
     pbar_lock = threading.Lock()
@@ -417,11 +421,13 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
 
     pbar.close()
     tasks = None
+    tlog(f"T({desc}): Phase2 计算完成, {total_stats['pages_modified']} 页修改")
 
     if not all_modifications:
         return False
 
     # ── Phase 3: 单次写入 (顺序应用修改 + 保存) ──
+    tlog(f"T({desc}): Phase3 fitz.open 开始")
     doc = fitz.open(input_path)
     for page_idx, modifications in sorted(all_modifications.items()):
         page = doc[page_idx]
@@ -432,11 +438,16 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
             for t_rect, t_data in tiles:
                 page.insert_image(t_rect, stream=t_data, overlay=True)
 
+    tlog(f"T({desc}): Phase3 write-back 完成")
+    tlog(f"T({desc}): Phase3 doc.save 开始")
     doc.save(output_path, garbage=4, deflate=True)
+    tlog(f"T({desc}): Phase3 doc.save 完成")
     doc.close()
 
     # libdeflate 后处理 (silently handles /Pages loop)
+    tlog(f"T({desc}): Phase3 _recompress 开始")
     _recompress_streams_libdeflate(output_path)
+    tlog(f"T({desc}): Phase3 _recompress 完成")
 
     safe_print(
         f"      [STAT] 切片统计: 修改={total_stats['pages_modified']}"

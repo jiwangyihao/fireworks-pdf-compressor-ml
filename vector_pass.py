@@ -11,7 +11,7 @@ from config import (
     VECTOR_SPLIT_THRESHOLD_BYTES, VECTOR_CHUNK_TARGET_BYTES,
     VECTOR_INNER_WORKERS, REGEX_STREAM_WORKERS,
 )
-from utils import safe_print, is_valid_pdf, libdeflate_compress_pdf, zlib_compress
+from utils import safe_print, is_valid_pdf, libdeflate_compress_pdf, tlog
 
 
 # ─── cm 坐标截断 (翻译矩阵 1 0 0 1 tx ty cm 的 tx/ty 精度) ─────────────────
@@ -147,8 +147,10 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         inline_img_re = re.compile(rb"(^|\\s)BI(\\s|$)")
 
         # Phase 1: 单次 open，读取全部候选流到内存
+        tlog(f"V({desc}): Phase1 pikepdf.open 开始")
         candidate_raw = {}  # xref -> raw_bytes
         with pikepdf.open(input_path) as pdf:
+            tlog(f"V({desc}): Phase1 pikepdf.open 完成")
             # 自适应 sig_figs：超大页面需要更高精度以保护细微矢量特征
             _BASE_DIM = 612.0  # 标准 A4 宽度 (pt)
             max_page_dim = 0.0
@@ -184,8 +186,10 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
 
         total_bytes = sum(len(v) for v in candidate_raw.values())
         total_xrefs = len(candidate_raw)
+        tlog(f"V({desc}): Phase1 完成, {total_xrefs} 流, {total_bytes/1024/1024:.1f} MB")
 
         # Phase 2: 多线程并行 Cython 处理（纯内存，不再打开 PDF）
+        tlog(f"V({desc}): Phase2 tqdm+线程池开始")
         all_results = {}
         done_bytes = [0]
         done_streams = [0]
@@ -232,6 +236,7 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         if done_bytes[0] < total_bytes:
             pbar.update(total_bytes - done_bytes[0])
         pbar.close()
+        tlog(f"V({desc}): Phase2 tqdm完成")
 
         # 释放原始数据内存
         candidate_raw.clear()
@@ -239,18 +244,22 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         if not all_results:
             return False
 
-        # Phase 3: 单次 open，写回优化结果 (libdeflate 预压缩)
+        # Phase 3: pikepdf 写回 + libdeflate 精压
+        tlog(f"V({desc}): Phase3 pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
+            tlog(f"V({desc}): Phase3 pikepdf.open 完成, 写回 {len(all_results)} 流")
             for xref, data in all_results.items():
-                compressed = zlib_compress(data, LIBDEFLATE_LEVEL)
-                pdf.objects[xref].write(compressed, filter=pikepdf.Name("/FlateDecode"))
-            pdf.remove_unreferenced_resources()
+                pdf.objects[xref].write(data)
+            tlog(f"V({desc}): Phase3 写回完成")
+            all_results.clear()
             libdeflate_compress_pdf(pdf)
+            tlog(f"V({desc}): Phase3 pikepdf.save 开始")
             pdf.save(
                 output_path,
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
+            tlog(f"V({desc}): Phase3 pikepdf.save 完成")
         return is_valid_pdf(output_path)
     except:
         return False
@@ -271,7 +280,9 @@ def run_shape_pass(input_path, output_path, desc="形状简化"):
         inline_img_re = re.compile(rb"(^|\s)BI(\s|$)")
         candidates = {}
 
+        tlog(f"S({desc}): pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
+            tlog(f"S({desc}): pikepdf.open 完成")
             for i, obj in enumerate(pdf.objects):
                 if isinstance(obj, pikepdf.Stream):
                     sub = str(obj.get("/Subtype") or "")
@@ -288,6 +299,8 @@ def run_shape_pass(input_path, output_path, desc="形状简化"):
 
         total_bytes = sum(len(v) for v in candidates.values())
         total_xrefs = len(candidates)
+        tlog(f"S({desc}): 读取完成, {total_xrefs} 流, {total_bytes/1024/1024:.1f} MB")
+        tlog(f"S({desc}): tqdm+线程池开始")
 
         all_results = {}
         done_bytes = [0]
@@ -328,6 +341,7 @@ def run_shape_pass(input_path, output_path, desc="形状简化"):
                     all_results[xref] = opt
 
         pbar.close()
+        tlog(f"S({desc}): tqdm完成")
         candidates.clear()
 
         safe_print(f"      [形状] 圆→菱形: {stats[0]:,}, 零段: {stats[1]:,}, cm截断: {stats[2]:,}")
@@ -335,17 +349,21 @@ def run_shape_pass(input_path, output_path, desc="形状简化"):
         if not all_results:
             return False
 
+        tlog(f"S({desc}): Phase3 pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
+            tlog(f"S({desc}): Phase3 pikepdf.open 完成, 写回 {len(all_results)} 流")
             for xref, data in all_results.items():
-                compressed = zlib_compress(data, LIBDEFLATE_LEVEL)
-                pdf.objects[xref].write(compressed, filter=pikepdf.Name("/FlateDecode"))
-            pdf.remove_unreferenced_resources()
+                pdf.objects[xref].write(data)
+            tlog(f"S({desc}): Phase3 写回完成")
+            all_results.clear()
             libdeflate_compress_pdf(pdf)
+            tlog(f"S({desc}): Phase3 pikepdf.save 开始")
             pdf.save(
                 output_path,
                 compress_streams=True,
                 object_stream_mode=pikepdf.ObjectStreamMode.generate,
             )
+            tlog(f"S({desc}): Phase3 pikepdf.save 完成")
         return is_valid_pdf(output_path)
     except Exception:
         return False

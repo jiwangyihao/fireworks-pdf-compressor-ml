@@ -1,5 +1,6 @@
 """通用工具函数 (无业务逻辑依赖)"""
 import os
+import time
 import zlib
 import ctypes
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,21 @@ import pikepdf
 from tqdm import tqdm
 
 from config import LIBDEFLATE_LEVEL
+
+# ============================
+# 带时间戳的诊断日志
+# ============================
+_TLOG_ENABLED = os.environ.get("TLOG", "0") == "1"
+_TLOG_T0 = time.perf_counter()
+
+
+def tlog(msg):
+    """带时间戳的诊断日志，仅当环境变量 TLOG=1 时启用。"""
+    if not _TLOG_ENABLED:
+        return
+    elapsed = time.perf_counter() - _TLOG_T0
+    m, s = divmod(elapsed, 60)
+    safe_print(f"  [T {int(m):02d}:{s:06.3f}] {msg}")
 
 
 # ============================
@@ -161,6 +177,7 @@ def libdeflate_compress_pdf(pdf, level=LIBDEFLATE_LEVEL):
     在 pikepdf.save() 之前调用，避免双重压缩开销。
     ctypes DLL 可用时自动启用多线程并发（释放 GIL），否则回退到单线程 deflate 包。
     """
+    tlog("libdeflate_compress_pdf: 开始扫描候选流")
     candidates = []
     for obj in pdf.objects:
         if not isinstance(obj, pikepdf.Stream):
@@ -175,12 +192,14 @@ def libdeflate_compress_pdf(pdf, level=LIBDEFLATE_LEVEL):
     if not candidates:
         return
 
+    tlog(f"libdeflate_compress_pdf: {len(candidates)} 候选流")
     use_parallel = _init_ctypes_libdeflate() and len(candidates) >= 8
 
     if use_parallel:
         _libdeflate_compress_parallel(candidates, level)
     else:
         _libdeflate_compress_sequential(candidates, level)
+    tlog("libdeflate_compress_pdf: 完成")
 
 
 def _libdeflate_compress_parallel(candidates, level):
@@ -267,8 +286,12 @@ def _libdeflate_compress_sequential(candidates, level):
 def _recompress_streams_libdeflate(pdf_path, level=LIBDEFLATE_LEVEL):
     """文件级 libdeflate 重压缩（用于 GS/fitz 等外部保存后的后处理）。"""
     try:
+        tlog("_recompress: pikepdf.open 开始")
         with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+            tlog("_recompress: pikepdf.open 完成")
             libdeflate_compress_pdf(pdf, level)
+            tlog("_recompress: pikepdf.save 开始")
             pdf.save(pdf_path)
+            tlog("_recompress: pikepdf.save 完成")
     except Exception:
         pass
