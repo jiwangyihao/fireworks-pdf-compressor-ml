@@ -25,19 +25,34 @@
   2. Ghostscript 重排（含文本异常检测与回退）
   3. 安全图片压缩（低风险重编码）
 - **阶段二（有损交错）**
-  - 固定顺序：`矢量 -> 图片 -> 切片`
-  - 固定强度阶梯：`50dB -> 45dB -> 40dB -> 35dB`
-  - 文件仍超目标时逐步增强压缩强度
+  - 每级固定顺序：`矢量 -> 图片 -> 切片`
+  - 强度阶梯：`L1(50dB) -> L2(45dB) -> L3a(激进矢量) -> L3b(形状+40dB) -> L4(35dB)`
+  - 文件仍超目标时逐步增强；低于 100MB 则提前退出
 
 ### 矢量压缩
 
 - 矢量压缩作用于 PDF 绘图指令流（路径命令与坐标数字）。
-- 强度从低到高可理解为四个层级：
-  - **L1（保守）**：仅轻度减少坐标冗余，视觉变化通常不可察觉，适合对版式稳定性要求极高的文档。
-  - **L2（均衡）**：进一步降低路径数值精度，在大多数课件和笔记中能获得更好的体积收益，同时保持线条连续性。
-  - **L3（激进）**：明显加强路径压缩，对复杂矢量页面收益更高；在局部高密度细节处，线条圆滑度可能轻微下降。
-  - **L4（最强）**：在 L3 基础上进一步简化极短曲线段，优先追求极限体积；更适合以“可读性优先、细节次之”的分发场景。
-- 实际执行时，这些强度会在有损阶段中逐步推进，而不是一次性直接跳到最高强度。
+- 强度从低到高分为五个层级：
+  - **L1（保守）**：轻度减少坐标冗余，视觉变化几乎不可察觉。
+  - **L2（均衡）**：进一步降低路径数值精度，大多数课件/笔记中体积收益明显，同时保持线条连续性。
+  - **L3a（激进矢量）**：激进矢量压缩（含极短曲线段简化），作为独立阶段提供额外矢量体积收益。
+  - **L3b（形状变换）**：将圆弧绘图指令做菱形近似（圆→菱形），是单步体积收益最大的阶段。
+  - **L4（最强）**：在 L3b 基础上继续缩减矢量精度，仅在文件仍超目标时触发。
+- 实际执行时，这些强度在有损阶段中逐步推进，低于 100MB 阈值即提前退出。
+
+### 压缩效果示例
+
+以一份 **141 页板写笔记**（185.63 MB）为测试样本，第 6 页局部对比（10%~30% 区域，8× 渲染）：
+
+|                原始 (185.63 MB)                |            无损 (157.57 MB, 15.1%)             |         L1 (149.81 MB, 19.3%)          |         L2 (132.41 MB, 28.7%)          |
+| :--------------------------------------------: | :--------------------------------------------: | :------------------------------------: | :------------------------------------: |
+| ![原始](measure_output/compare_0_original.png) | ![无损](measure_output/compare_1_lossless.png) | ![L1](measure_output/compare_2_L1.png) | ![L2](measure_output/compare_3_L2.png) |
+
+|                原始 (185.63 MB)                |          L3a (110.23 MB, 40.6%)          |          L3b (64.96 MB, 65.0%)           |          L4 (49.59 MB, 73.3%)          |
+| :--------------------------------------------: | :--------------------------------------: | :--------------------------------------: | :------------------------------------: |
+| ![原始](measure_output/compare_0_original.png) | ![L3a](measure_output/compare_4_L3a.png) | ![L3b](measure_output/compare_5_L3b.png) | ![L4](measure_output/compare_6_L4.png) |
+
+> 测试环境：Windows，compress.py 默认配置。切片步骤在本样本中均未产生额外收益（自动跳过）。
 
 ### 文件类型与收益侧重点
 
@@ -118,19 +133,34 @@ while keeping documents readable.
   2. Ghostscript relayout with fallback on text-integrity issues
   3. Safe image recompression
 - **Stage 2 (interleaved lossy)**
-  - Fixed order: `vector -> image -> tiling`
-  - Fixed ladder: `50dB -> 45dB -> 40dB -> 35dB`
-  - Compression intensity increases only when needed
+  - Per-level order: `vector -> image -> tiling`
+  - Intensity ladder: `L1(50dB) -> L2(45dB) -> L3a(aggressive vector) -> L3b(shape+40dB) -> L4(35dB)`
+  - Exits early once file drops below 100MB
 
 ### Vector compression
 
 - Vector compression directly reduces the size of drawing-command streams.
-- The four strength levels can be interpreted as:
-  - **L1 (conservative)**: mild coordinate simplification, usually visually lossless.
-  - **L2 (balanced)**: stronger reduction with good size gains on common notes/slides while preserving line continuity.
-  - **L3 (aggressive)**: higher compression on complex vector pages, with a small risk of reduced smoothness in dense local details.
-  - **L4 (maximum)**: further simplifies tiny curve segments for maximum size reduction; best for distribution scenarios where readability is prioritized over fine geometric fidelity.
-- In practice, these levels are applied progressively during the lossy stage instead of jumping directly to the strongest level.
+- Five strength levels:
+  - **L1 (conservative)**: mild coordinate simplification. Usually visually lossless.
+  - **L2 (balanced)**: stronger numeric reduction. Good gains on typical notes/slides while preserving line continuity.
+  - **L3a (aggressive vector)**: aggressive vector-only compression including tiny-curve simplification, as a standalone stage for additional vector-specific gains.
+  - **L3b (shape transform)**: approximates circle arcs as diamonds (circle→diamond). The single largest size-reduction step.
+  - **L4 (maximum)**: further reduces vector precision on top of L3b. Only triggered when the file still exceeds the target.
+- In practice, levels are applied progressively and the pipeline exits early once the file drops below 100MB.
+
+### Compression results example
+
+Using a **141-page handwritten-notes PDF** (185.63 MB) as test sample. Page 6 crop comparison (10%–30% region, 8× render):
+
+|                Original (185.63 MB)                |            Lossless (157.57 MB, 15.1%)             |         L1 (149.81 MB, 19.3%)          |         L2 (132.41 MB, 28.7%)          |
+| :------------------------------------------------: | :------------------------------------------------: | :------------------------------------: | :------------------------------------: |
+| ![Original](measure_output/compare_0_original.png) | ![Lossless](measure_output/compare_1_lossless.png) | ![L1](measure_output/compare_2_L1.png) | ![L2](measure_output/compare_3_L2.png) |
+
+|                Original (185.63 MB)                |          L3a (110.23 MB, 40.6%)          |          L3b (64.96 MB, 65.0%)           |          L4 (49.59 MB, 73.3%)          |
+| :------------------------------------------------: | :--------------------------------------: | :--------------------------------------: | :------------------------------------: |
+| ![Original](measure_output/compare_0_original.png) | ![L3a](measure_output/compare_4_L3a.png) | ![L3b](measure_output/compare_5_L3b.png) | ![L4](measure_output/compare_6_L4.png) |
+
+> Test environment: Windows, default compress.py configuration. Tiling steps provided no additional gain on this sample (auto-skipped).
 
 ### Compression emphasis by file type
 
