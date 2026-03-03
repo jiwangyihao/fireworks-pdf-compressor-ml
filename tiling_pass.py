@@ -16,6 +16,7 @@ from config import (
     JP2K_THREADS, JP2K_WORKERS, PDF_REDACT_IMAGE_REMOVE,
 )
 from utils import safe_print, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, tlog
+from vector_pass import invalidate_stream_cache
 
 # 纯图片页面缓存: 首次扫描后记录哪些页是纯图片页（无文字无绘图），后续调用直接复用
 _pure_image_pages_cache = None  # None=未扫描, set()=已扫描
@@ -454,6 +455,7 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
 
     # ── Phase 3: 单次写入 (顺序应用修改 + 保存) ──
     tlog(f"T({desc}): Phase3 fitz.open 开始")
+    invalidate_stream_cache()  # clean_contents/apply_redactions 修改内容流
     doc = fitz.open(input_path)
     for page_idx, modifications in sorted(all_modifications.items()):
         page = doc[page_idx]

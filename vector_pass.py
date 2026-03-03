@@ -14,6 +14,27 @@ from config import (
 from utils import safe_print, is_valid_pdf, libdeflate_compress_pdf, tlog
 
 
+# ─── 流内容缓存 (跨 pass 重用解压数据) ──────────────────────────────────────
+_stream_cache = None  # list[bytes] | None: 候选流解压内容 (按发现顺序)
+
+
+def invalidate_stream_cache():
+    """外部代码修改内容流后调用以使缓存失效。"""
+    global _stream_cache
+    _stream_cache = None
+
+
+def _collect_candidate_xrefs(pdf):
+    """快速收集候选流 xref 列表 (不解压, 仅类型过滤)。"""
+    xrefs = []
+    for i, obj in enumerate(pdf.objects):
+        if isinstance(obj, pikepdf.Stream):
+            sub = str(obj.get("/Subtype") or "")
+            if "/Image" not in sub and "/Font" not in sub:
+                xrefs.append(i)
+    return xrefs
+
+
 # ─── cm 坐标截断 (翻译矩阵 1 0 0 1 tx ty cm 的 tx/ty 精度) ─────────────────
 _NUM_RE_B = rb"[-+]?(?:\d*\.\d+|\d+)"
 _CM_RE = re.compile(
@@ -143,12 +164,16 @@ def _split_and_optimize_large_stream(raw_data, sig_figs, enable_smart_c, progres
 
 
 def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
+    global _stream_cache
     try:
         inline_img_re = re.compile(rb"(^|\\s)BI(\\s|$)")
 
-        # Phase 1: 单次 open，读取全部候选流到内存
+        # Phase 1: 单次 open，读取全部候选流到内存 (或从缓存恢复)
         tlog(f"V({desc}): Phase1 pikepdf.open 开始")
         candidate_raw = {}  # xref -> raw_bytes
+        xref_list = []
+        cache_hit = False
+
         with pikepdf.open(input_path) as pdf:
             tlog(f"V({desc}): Phase1 pikepdf.open 完成")
             # 自适应 sig_figs：超大页面需要更高精度以保护细微矢量特征
@@ -170,23 +195,38 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
                     sig_figs = sig_figs + extra_sf
                     safe_print(f"      [自适应] 页面最大尺寸 {max_page_dim:.0f}pt > 标准 {_BASE_DIM:.0f}pt, sig_figs {sig_figs - extra_sf}→{sig_figs}")
 
-            for i, obj in enumerate(pdf.objects):
-                if isinstance(obj, pikepdf.Stream):
-                    subtype = str(obj.get("/Subtype") or "")
-                    if "/Image" not in subtype and "/Font" not in subtype:
-                        try:
-                            raw = obj.read_bytes()
-                            if not inline_img_re.search(raw):
-                                candidate_raw[i] = raw
-                        except:
-                            pass
+            # 尝试从缓存恢复
+            if _stream_cache is not None:
+                xref_list = _collect_candidate_xrefs(pdf)
+                if len(xref_list) == len(_stream_cache):
+                    candidate_raw = {xref_list[j]: _stream_cache[j]
+                                     for j in range(len(_stream_cache))}
+                    cache_hit = True
+                    tlog(f"V({desc}): Phase1 缓存命中, {len(xref_list)} 流")
+                else:
+                    tlog(f"V({desc}): Phase1 缓存失效 ({len(xref_list)} vs {len(_stream_cache)})")
+                    _stream_cache = None
+
+            if not cache_hit:
+                for i, obj in enumerate(pdf.objects):
+                    if isinstance(obj, pikepdf.Stream):
+                        subtype = str(obj.get("/Subtype") or "")
+                        if "/Image" not in subtype and "/Font" not in subtype:
+                            try:
+                                raw = obj.read_bytes()
+                                if not inline_img_re.search(raw):
+                                    candidate_raw[i] = raw
+                            except:
+                                pass
+                xref_list = list(candidate_raw.keys())
 
         if not candidate_raw:
             return False
 
         total_bytes = sum(len(v) for v in candidate_raw.values())
         total_xrefs = len(candidate_raw)
-        tlog(f"V({desc}): Phase1 完成, {total_xrefs} 流, {total_bytes/1024/1024:.1f} MB")
+        tlog(f"V({desc}): Phase1 完成, {total_xrefs} 流, {total_bytes/1024/1024:.1f} MB"
+             + (" (缓存)" if cache_hit else ""))
 
         # Phase 2: 多线程并行 Cython 处理（纯内存，不再打开 PDF）
         tlog(f"V({desc}): Phase2 tqdm+线程池开始")
@@ -238,11 +278,22 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         pbar.close()
         tlog(f"V({desc}): Phase2 tqdm完成")
 
+        # 填充/更新流缓存
+        if not cache_hit and _stream_cache is None:
+            _stream_cache = list(candidate_raw.values())
+
         # 释放原始数据内存
         candidate_raw.clear()
 
         if not all_results:
             return False
+
+        # 用 Phase2 修改结果更新缓存
+        if _stream_cache is not None:
+            _xts = {x: j for j, x in enumerate(xref_list)}
+            for xref, data in all_results.items():
+                if xref in _xts:
+                    _stream_cache[_xts[xref]] = data
 
         # Phase 3: pikepdf 写回 + libdeflate 精压
         tlog(f"V({desc}): Phase3 pikepdf.open 开始")
@@ -277,30 +328,49 @@ def _optimize_shape_stream(raw_data):
 
 def run_shape_pass(input_path, output_path, desc="形状简化"):
     """对 PDF 所有内容流执行形状简化 (圆→菱形)。返回 True/False。"""
+    global _stream_cache
     try:
         inline_img_re = re.compile(rb"(^|\s)BI(\s|$)")
         candidates = {}
+        xref_list = []
+        cache_hit = False
 
         tlog(f"S({desc}): pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
             tlog(f"S({desc}): pikepdf.open 完成")
-            for i, obj in enumerate(pdf.objects):
-                if isinstance(obj, pikepdf.Stream):
-                    sub = str(obj.get("/Subtype") or "")
-                    if "/Image" not in sub and "/Font" not in sub:
-                        try:
-                            raw = obj.read_bytes()
-                            if not inline_img_re.search(raw):
-                                candidates[i] = raw
-                        except Exception:
-                            pass
+
+            # 尝试从缓存恢复
+            if _stream_cache is not None:
+                xref_list = _collect_candidate_xrefs(pdf)
+                if len(xref_list) == len(_stream_cache):
+                    candidates = {xref_list[j]: _stream_cache[j]
+                                  for j in range(len(_stream_cache))}
+                    cache_hit = True
+                    tlog(f"S({desc}): 缓存命中, {len(xref_list)} 流")
+                else:
+                    tlog(f"S({desc}): 缓存失效 ({len(xref_list)} vs {len(_stream_cache)})")
+                    _stream_cache = None
+
+            if not cache_hit:
+                for i, obj in enumerate(pdf.objects):
+                    if isinstance(obj, pikepdf.Stream):
+                        sub = str(obj.get("/Subtype") or "")
+                        if "/Image" not in sub and "/Font" not in sub:
+                            try:
+                                raw = obj.read_bytes()
+                                if not inline_img_re.search(raw):
+                                    candidates[i] = raw
+                            except Exception:
+                                pass
+                xref_list = list(candidates.keys())
 
         if not candidates:
             return False
 
         total_bytes = sum(len(v) for v in candidates.values())
         total_xrefs = len(candidates)
-        tlog(f"S({desc}): 读取完成, {total_xrefs} 流, {total_bytes/1024/1024:.1f} MB")
+        tlog(f"S({desc}): 读取完成, {total_xrefs} 流, {total_bytes/1024/1024:.1f} MB"
+             + (" (缓存)" if cache_hit else ""))
         tlog(f"S({desc}): tqdm+线程池开始")
 
         all_results = {}
@@ -343,12 +413,24 @@ def run_shape_pass(input_path, output_path, desc="形状简化"):
 
         pbar.close()
         tlog(f"S({desc}): tqdm完成")
+
+        # 填充/更新流缓存
+        if not cache_hit and _stream_cache is None:
+            _stream_cache = list(candidates.values())
+
         candidates.clear()
 
         safe_print(f"      [形状] 圆→菱形: {stats[0]:,}, 零段: {stats[1]:,}, cm截断: {stats[2]:,}")
 
         if not all_results:
             return False
+
+        # 用修改结果更新缓存
+        if _stream_cache is not None:
+            _xts = {x: j for j, x in enumerate(xref_list)}
+            for xref, data in all_results.items():
+                if xref in _xts:
+                    _stream_cache[_xts[xref]] = data
 
         tlog(f"S({desc}): Phase3 pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
