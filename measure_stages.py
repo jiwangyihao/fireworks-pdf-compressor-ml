@@ -129,16 +129,12 @@ def main():
             safe_print(f"  [GUARD] GS 流级回退: {rs} 流 / {ap} 页")
         # 页级回退
         gs_gf = tmp_gs + ".m_gp"
-        page_rollback_triggered = False
         gp_ok, gp_cnt = rollback_worse_pages_by_image_payload(current, gs_cand, gs_gf, skip_recompress=True)
         if gp_ok and is_valid_pdf(gs_gf):
             gs_cand = gs_gf
-            page_rollback_triggered = True
             safe_print(f"  [GUARD] GS 页级回退: {gp_cnt} 页")
-        # 仅在 fitz 页级回退触发时需要重压缩 (fitz save 可能改变流压缩质量)
-        # 若仅 pikepdf 流级回退，所有流已为 libdeflate 质量，无需重压缩
-        if page_rollback_triggered:
-            _recompress_streams_libdeflate(gs_cand)
+        # fitz.save(deflate=True) 仅压缩未压缩流，不会重编码已有 FlateDecode 流，
+        # 因此页级回退后流质量 (libdeflate) 已保持，无需重压缩。
         gs_mb = get_file_mb(gs_cand)
         if gs_mb > 0.01 and gs_mb < prev_mb:
             current = gs_cand
