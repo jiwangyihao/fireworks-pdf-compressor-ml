@@ -636,6 +636,278 @@ def optimize_stream_scan_nogil(bytes raw_data, int sig_figs=4, bint enable_smart
     return out
 
 
+# ─── Shape optimization: 4-Bézier circle → CW diamond + zero-seg deletion ───
+
+cdef inline int _parse_line_cmd(const char* src, Py_ssize_t start, Py_ssize_t end,
+                                 Py_ssize_t* nstarts, Py_ssize_t* nends, int max_nums) nogil:
+    """解析一行 PDF 内容流命令，返回 'm','c','l' 或 0。"""
+    cdef Py_ssize_t p = start
+    cdef int cnt = 0
+    cdef Py_ssize_t q
+    cdef char ch
+    p = _skip_ws(src, p, end)
+    while p < end and cnt < max_nums:
+        if not _looks_number_start(src, p, end):
+            break
+        q = _parse_num_end(src, p, end)
+        if q <= p:
+            break
+        nstarts[cnt] = p
+        nends[cnt] = q
+        cnt += 1
+        p = _skip_ws(src, q, end)
+    if p >= end:
+        return 0
+    ch = src[p]
+    p = _skip_ws(src, p + 1, end)
+    if p < end:
+        return 0
+    if ch == c'm' and cnt == 2:
+        return c'm'
+    if ch == c'c' and cnt == 6:
+        return c'c'
+    if ch == c'l' and cnt == 2:
+        return c'l'
+    return 0
+
+
+cdef inline bint _bytes_equal(const char* s, Py_ssize_t s1, Py_ssize_t e1,
+                                Py_ssize_t s2, Py_ssize_t e2) nogil:
+    """判断 s[s1:e1] 与 s[s2:e2] 字节相同。"""
+    cdef Py_ssize_t len1 = e1 - s1
+    cdef Py_ssize_t len2 = e2 - s2
+    cdef Py_ssize_t k
+    if len1 != len2:
+        return False
+    for k in range(len1):
+        if s[s1 + k] != s[s2 + k]:
+            return False
+    return True
+
+
+def optimize_shapes_scan_nogil(bytes raw_data):
+    """形状优化: 4-Bézier 圆→CW 菱形 + 零长度线段删除。
+    返回 (optimized_bytes, circle_count, zeroseg_count)。"""
+    cdef Py_ssize_t n = len(raw_data)
+    if n == 0:
+        return (raw_data, 0, 0)
+
+    cdef const char* src = raw_data
+    cdef char* dst = <char*>malloc(n + 4096)
+    if dst == NULL:
+        return (raw_data, 0, 0)
+
+    cdef Py_ssize_t w = 0, i = 0, line_start, line_end, length
+    cdef bint had_nl
+    cdef int cmd, j, k
+    cdef Py_ssize_t ns[6]
+    cdef Py_ssize_t ne[6]
+
+    # 状态: 0=无, 1=有m, 2=m+c1, 3=m+c2, 4=m+c3
+    cdef int pending = 0
+    cdef Py_ssize_t b_ls[5]
+    cdef Py_ssize_t b_le[5]
+    cdef int b_nl[5]
+
+    cdef Py_ssize_t m_ns[2]
+    cdef Py_ssize_t m_ne[2]
+    cdef Py_ssize_t c0_ns[6]
+    cdef Py_ssize_t c0_ne[6]
+    cdef Py_ssize_t c1_ns[6]
+    cdef Py_ssize_t c1_ne[6]
+    cdef Py_ssize_t c2_ns[6]
+    cdef Py_ssize_t c2_ne[6]
+    cdef Py_ssize_t c3_ns[6]
+    cdef Py_ssize_t c3_ne[6]
+
+    cdef int circles = 0, zerosegs = 0
+    cdef bytes out
+
+    with nogil:
+        while i < n:
+            line_start = i
+            while i < n and src[i] != c'\n':
+                i += 1
+            line_end = i
+            had_nl = (i < n)
+            if had_nl:
+                i += 1
+
+            cmd = _parse_line_cmd(src, line_start, line_end, ns, ne, 6)
+
+            if pending == 0:
+                if cmd == c'm':
+                    pending = 1
+                    b_ls[0] = line_start; b_le[0] = line_end; b_nl[0] = had_nl
+                    m_ns[0] = ns[0]; m_ne[0] = ne[0]
+                    m_ns[1] = ns[1]; m_ne[1] = ne[1]
+                else:
+                    length = line_end - line_start
+                    memcpy(dst + w, src + line_start, length); w += length
+                    if had_nl:
+                        dst[w] = c'\n'; w += 1
+
+            elif pending == 1:
+                if cmd == c'c':
+                    pending = 2
+                    b_ls[1] = line_start; b_le[1] = line_end; b_nl[1] = had_nl
+                    for k in range(6):
+                        c0_ns[k] = ns[k]; c0_ne[k] = ne[k]
+                elif cmd == c'l' and _bytes_equal(src, m_ns[0], m_ne[0], ns[0], ne[0]) and \
+                                     _bytes_equal(src, m_ns[1], m_ne[1], ns[1], ne[1]):
+                    zerosegs += 1
+                    length = b_le[0] - b_ls[0]
+                    memcpy(dst + w, src + b_ls[0], length); w += length
+                    if b_nl[0]:
+                        dst[w] = c'\n'; w += 1
+                    pending = 0
+                elif cmd == c'm':
+                    length = b_le[0] - b_ls[0]
+                    memcpy(dst + w, src + b_ls[0], length); w += length
+                    if b_nl[0]:
+                        dst[w] = c'\n'; w += 1
+                    b_ls[0] = line_start; b_le[0] = line_end; b_nl[0] = had_nl
+                    m_ns[0] = ns[0]; m_ne[0] = ne[0]
+                    m_ns[1] = ns[1]; m_ne[1] = ne[1]
+                else:
+                    length = b_le[0] - b_ls[0]
+                    memcpy(dst + w, src + b_ls[0], length); w += length
+                    if b_nl[0]:
+                        dst[w] = c'\n'; w += 1
+                    length = line_end - line_start
+                    memcpy(dst + w, src + line_start, length); w += length
+                    if had_nl:
+                        dst[w] = c'\n'; w += 1
+                    pending = 0
+
+            elif pending == 2:
+                if cmd == c'c':
+                    pending = 3
+                    b_ls[2] = line_start; b_le[2] = line_end; b_nl[2] = had_nl
+                    for k in range(6):
+                        c1_ns[k] = ns[k]; c1_ne[k] = ne[k]
+                else:
+                    for j in range(2):
+                        length = b_le[j] - b_ls[j]
+                        memcpy(dst + w, src + b_ls[j], length); w += length
+                        if b_nl[j]:
+                            dst[w] = c'\n'; w += 1
+                    if cmd == c'm':
+                        pending = 1
+                        b_ls[0] = line_start; b_le[0] = line_end; b_nl[0] = had_nl
+                        m_ns[0] = ns[0]; m_ne[0] = ne[0]
+                        m_ns[1] = ns[1]; m_ne[1] = ne[1]
+                    else:
+                        length = line_end - line_start
+                        memcpy(dst + w, src + line_start, length); w += length
+                        if had_nl:
+                            dst[w] = c'\n'; w += 1
+                        pending = 0
+
+            elif pending == 3:
+                if cmd == c'c':
+                    pending = 4
+                    b_ls[3] = line_start; b_le[3] = line_end; b_nl[3] = had_nl
+                    for k in range(6):
+                        c2_ns[k] = ns[k]; c2_ne[k] = ne[k]
+                else:
+                    for j in range(3):
+                        length = b_le[j] - b_ls[j]
+                        memcpy(dst + w, src + b_ls[j], length); w += length
+                        if b_nl[j]:
+                            dst[w] = c'\n'; w += 1
+                    if cmd == c'm':
+                        pending = 1
+                        b_ls[0] = line_start; b_le[0] = line_end; b_nl[0] = had_nl
+                        m_ns[0] = ns[0]; m_ne[0] = ne[0]
+                        m_ns[1] = ns[1]; m_ne[1] = ne[1]
+                    else:
+                        length = line_end - line_start
+                        memcpy(dst + w, src + line_start, length); w += length
+                        if had_nl:
+                            dst[w] = c'\n'; w += 1
+                        pending = 0
+
+            elif pending == 4:
+                if cmd == c'c':
+                    for k in range(6):
+                        c3_ns[k] = ns[k]; c3_ne[k] = ne[k]
+                    if _bytes_equal(src, m_ns[0], m_ne[0], c3_ns[4], c3_ne[4]) and \
+                       _bytes_equal(src, m_ns[1], m_ne[1], c3_ns[5], c3_ne[5]):
+                        # 圆→菱形: mx my m ep0x ep0y l ep1x ep1y l ep2x ep2y l
+                        circles += 1
+                        length = m_ne[0] - m_ns[0]
+                        memcpy(dst + w, src + m_ns[0], length); w += length
+                        dst[w] = c' '; w += 1
+                        length = m_ne[1] - m_ns[1]
+                        memcpy(dst + w, src + m_ns[1], length); w += length
+                        dst[w] = c' '; w += 1
+                        dst[w] = c'm'; w += 1
+                        dst[w] = c' '; w += 1
+                        length = c0_ne[4] - c0_ns[4]
+                        memcpy(dst + w, src + c0_ns[4], length); w += length
+                        dst[w] = c' '; w += 1
+                        length = c0_ne[5] - c0_ns[5]
+                        memcpy(dst + w, src + c0_ns[5], length); w += length
+                        dst[w] = c' '; w += 1
+                        dst[w] = c'l'; w += 1
+                        dst[w] = c' '; w += 1
+                        length = c1_ne[4] - c1_ns[4]
+                        memcpy(dst + w, src + c1_ns[4], length); w += length
+                        dst[w] = c' '; w += 1
+                        length = c1_ne[5] - c1_ns[5]
+                        memcpy(dst + w, src + c1_ns[5], length); w += length
+                        dst[w] = c' '; w += 1
+                        dst[w] = c'l'; w += 1
+                        dst[w] = c' '; w += 1
+                        length = c2_ne[4] - c2_ns[4]
+                        memcpy(dst + w, src + c2_ns[4], length); w += length
+                        dst[w] = c' '; w += 1
+                        length = c2_ne[5] - c2_ns[5]
+                        memcpy(dst + w, src + c2_ns[5], length); w += length
+                        dst[w] = c' '; w += 1
+                        dst[w] = c'l'; w += 1
+                        if had_nl:
+                            dst[w] = c'\n'; w += 1
+                    else:
+                        b_ls[4] = line_start; b_le[4] = line_end; b_nl[4] = had_nl
+                        for j in range(5):
+                            length = b_le[j] - b_ls[j]
+                            memcpy(dst + w, src + b_ls[j], length); w += length
+                            if b_nl[j]:
+                                dst[w] = c'\n'; w += 1
+                    pending = 0
+                else:
+                    for j in range(4):
+                        length = b_le[j] - b_ls[j]
+                        memcpy(dst + w, src + b_ls[j], length); w += length
+                        if b_nl[j]:
+                            dst[w] = c'\n'; w += 1
+                    if cmd == c'm':
+                        pending = 1
+                        b_ls[0] = line_start; b_le[0] = line_end; b_nl[0] = had_nl
+                        m_ns[0] = ns[0]; m_ne[0] = ne[0]
+                        m_ns[1] = ns[1]; m_ne[1] = ne[1]
+                    else:
+                        length = line_end - line_start
+                        memcpy(dst + w, src + line_start, length); w += length
+                        if had_nl:
+                            dst[w] = c'\n'; w += 1
+                        pending = 0
+
+        # 冲刷残余缓冲
+        if pending >= 1:
+            for j in range(pending):
+                length = b_le[j] - b_ls[j]
+                memcpy(dst + w, src + b_ls[j], length); w += length
+                if b_nl[j]:
+                    dst[w] = c'\n'; w += 1
+
+    out = <bytes>PyBytes_FromStringAndSize(dst, w)
+    free(dst)
+    return (out, circles, zerosegs)
+
+
 def optimize_stream_scan_strict(bytes raw_data, int sig_figs=4):
     """严格正确优先版：
     - 仅在 PDF 内容流的运算符上下文中压缩数值；

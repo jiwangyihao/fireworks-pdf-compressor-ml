@@ -16,7 +16,7 @@ from config import (
 )
 from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate
 from gs_pass import surgical_clean, run_gs_level0, rollback_worse_content_streams
-from vector_pass import run_regex_pass
+from vector_pass import run_regex_pass, run_shape_pass
 from tiling_pass import run_tiling_pass
 from image_pass import (
     rollback_worse_pages_by_image_payload,
@@ -315,7 +315,8 @@ def process_file(input_path, idx, total, unattended_mode=False):
         ("V", (3, False), "矢量 L2", ".tmp_v2"),
         ("I", (45,), "图片 45dB", ".tmp_i45"),
         ("T", (45,), "切片 45dB", ".tmp_t45"),
-        ("V", (3, True), "矢量 L3", ".tmp_v3"),
+        ("V", (3, True), "矢量 L3a", ".tmp_v3a"),
+        ("S", (), "形状 L3b", ".tmp_s3b"),
         ("I", (40,), "图片 40dB", ".tmp_i40"),
         ("T", (40,), "切片 40dB", ".tmp_t40"),
         ("V", (2, False), "矢量 L4", ".tmp_v4"),
@@ -337,6 +338,8 @@ def process_file(input_path, idx, total, unattended_mode=False):
             success = run_regex_pass(
                 lossy_working_file, next_file, args[0], args[1], desc
             )
+        elif stype == "S":
+            success = run_shape_pass(lossy_working_file, next_file, desc)
         elif stype == "I":
             success = run_image_pass_safe(lossy_working_file, next_file, args[0], desc)
         elif stype == "T":
