@@ -248,11 +248,12 @@ def run_regex_pass(input_path, output_path, sig_figs, enable_smart_c, desc):
         tlog(f"V({desc}): Phase3 pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
             tlog(f"V({desc}): Phase3 pikepdf.open 完成, 写回 {len(all_results)} 流")
+            dirty_xrefs = set(all_results.keys())
             for xref, data in all_results.items():
                 pdf.objects[xref].write(data)
             tlog(f"V({desc}): Phase3 写回完成")
             all_results.clear()
-            libdeflate_compress_pdf(pdf)
+            libdeflate_compress_pdf(pdf, only_xrefs=dirty_xrefs)
             tlog(f"V({desc}): Phase3 pikepdf.save 开始")
             pdf.save(
                 output_path,
@@ -352,11 +353,12 @@ def run_shape_pass(input_path, output_path, desc="形状简化"):
         tlog(f"S({desc}): Phase3 pikepdf.open 开始")
         with pikepdf.open(input_path) as pdf:
             tlog(f"S({desc}): Phase3 pikepdf.open 完成, 写回 {len(all_results)} 流")
+            dirty_xrefs = set(all_results.keys())
             for xref, data in all_results.items():
                 pdf.objects[xref].write(data)
             tlog(f"S({desc}): Phase3 写回完成")
             all_results.clear()
-            libdeflate_compress_pdf(pdf)
+            libdeflate_compress_pdf(pdf, only_xrefs=dirty_xrefs)
             tlog(f"S({desc}): Phase3 pikepdf.save 开始")
             pdf.save(
                 output_path,

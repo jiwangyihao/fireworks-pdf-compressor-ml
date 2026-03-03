@@ -171,15 +171,19 @@ def _get_num_workers():
         return 1
 
 
-def libdeflate_compress_pdf(pdf, level=LIBDEFLATE_LEVEL):
+def libdeflate_compress_pdf(pdf, level=LIBDEFLATE_LEVEL, only_xrefs=None):
     """对已打开的 pikepdf PDF 对象做 libdeflate 全流压缩（in-memory，不写磁盘）。
 
     在 pikepdf.save() 之前调用，避免双重压缩开销。
     ctypes DLL 可用时自动启用多线程并发（释放 GIL），否则回退到单线程 deflate 包。
+
+    only_xrefs: 若非 None，仅处理这些 xref 索引对应的流（脏流优化）。
     """
     tlog("libdeflate_compress_pdf: 开始扫描候选流")
     candidates = []
-    for obj in pdf.objects:
+    for i, obj in enumerate(pdf.objects):
+        if only_xrefs is not None and i not in only_xrefs:
+            continue
         if not isinstance(obj, pikepdf.Stream):
             continue
         filt = obj.get("/Filter")
@@ -192,7 +196,8 @@ def libdeflate_compress_pdf(pdf, level=LIBDEFLATE_LEVEL):
     if not candidates:
         return
 
-    tlog(f"libdeflate_compress_pdf: {len(candidates)} 候选流")
+    scope = "dirty" if only_xrefs is not None else "all"
+    tlog(f"libdeflate_compress_pdf: {len(candidates)} 候选流 ({scope})")
     use_parallel = _init_ctypes_libdeflate() and len(candidates) >= 8
 
     if use_parallel:

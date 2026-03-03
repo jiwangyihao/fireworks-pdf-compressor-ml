@@ -13,7 +13,7 @@ from config import (
     GRID_SIZE, COLOR_STD_THRESHOLD, BINARIZE_THRESHOLD,
     LIBDEFLATE_LEVEL, JP2K_THREADS, JP2K_WORKERS, MIN_IMAGE_SIZE,
 )
-from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf, zlib_compress, tlog
+from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, zlib_compress, tlog
 from tiling_pass import detect_strict_color, detect_mono_or_hybrid
 
 # 混合页面索引缓存: 首次扫描后记录哪些页面是混合页面(有文字/绘图)
@@ -553,8 +553,6 @@ def run_image_pass_safe(input_path, output_path, quality_db, desc):
                     if "/ICCProfile" in obj:
                         del obj["/ICCProfile"]  # type: ignore
                 tlog(f"I({desc}): PhaseC write-back 完成")
-                tlog(f"I({desc}): PhaseC libdeflate 开始")
-                libdeflate_compress_pdf(pdf)
                 tlog(f"I({desc}): PhaseC save 开始")
                 pdf.save(output_path, compress_streams=True)
                 tlog(f"I({desc}): PhaseC save 完成")
