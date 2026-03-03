@@ -1,6 +1,6 @@
 [project]
 name = "fireworks-pdf-compressor-ml"
-version = "0.1.0"
+version = "1.1.0"
 description = "PDF compression with optional ML enhancement pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
