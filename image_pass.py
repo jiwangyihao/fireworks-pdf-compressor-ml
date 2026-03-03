@@ -16,6 +16,10 @@ from config import (
 from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate, libdeflate_compress_pdf, zlib_compress, tlog
 from tiling_pass import detect_strict_color, detect_mono_or_hybrid
 
+# 混合页面索引缓存: 首次扫描后记录哪些页面是混合页面(有文字/绘图)
+# 页码索引是位置不变量，不受 pikepdf save 重编号 xref 的影响
+_mixed_page_indices_cache = None  # None=未扫描, set()=已扫描
+
 
 # ============================
 # 图像大小估算 & 页级/流级回退守卫
@@ -358,36 +362,71 @@ def _encode_single_image(xref, pil_image, orig_raw_size, target_quality, mixed_p
 def run_image_pass_safe(input_path, output_path, quality_db, desc):
     """安全图片压缩 Pass"""
 
-    # 1. 预扫描：识别哪些 XREF 属于 "混合页面" (有文字/矢量)
+    # 1. 预扫描：识别哪些页面是 "混合页面" (有文字/矢量)
     # 这些页面上的灰度图必须在安全图片压缩阶段处理，不能留给破坏性切片阶段
+    # 注意：缓存页码索引而非 xref，因为 pikepdf save 会重编号所有对象 xref
     tlog(f"I({desc}): 预扫描混合页面开始")
-    mixed_page_xrefs = set()
-    try:
-        doc = fitz.open(input_path)
-        for page in doc:
-            has_text = len(page.get_text("text").strip()) > 0
-            # get_drawings() 开销较大；有文字时已可判定为混合页，直接短路。
-            has_drawings = False
-            if not has_text:
-                has_drawings = len(page.get_drawings()) > 0
+    global _mixed_page_indices_cache
 
-            if has_text or has_drawings:
-                # 这是一个混合页面，记录其所有图片 XREF
-                img_list = page.get_images(full=True)
-                for img in img_list:
-                    mixed_page_xrefs.add(img[0])  # xref is index 0
-        doc.close()
-    except:
-        pass  # 如果扫描失败，mixed_page_xrefs 为空，灰度图将全部跳过给切片阶段 (风险较小)
-    tlog(f"I({desc}): 预扫描完成, mixed_page_xrefs={len(mixed_page_xrefs)}")
+    if _mixed_page_indices_cache is None:
+        # 首次调用：fitz 全量扫描，确定哪些页面是混合页面
+        mixed_page_indices = set()
+        try:
+            doc = fitz.open(input_path)
+            for page_idx, page in enumerate(doc):
+                has_text = len(page.get_text("text").strip()) > 0
+                # get_drawings() 开销较大；有文字时已可判定为混合页，直接短路。
+                has_drawings = False
+                if not has_text:
+                    has_drawings = len(page.get_drawings()) > 0
+                if has_text or has_drawings:
+                    mixed_page_indices.add(page_idx)
+            doc.close()
+        except:
+            mixed_page_indices = set()
+        _mixed_page_indices_cache = mixed_page_indices
+        tlog(f"I({desc}): 页面索引缓存已建立, {len(mixed_page_indices)} 个混合页面")
+    else:
+        tlog(f"I({desc}): 使用页面索引缓存, {len(_mixed_page_indices_cache)} 个混合页面")
 
     # === Phase A: 单线程提取 (GIL-bound pikepdf) ===
-    # 只打开PDF一次，提取所有图片为PIL对象 + 原始大小
+    # 打开PDF，从缓存的混合页面索引中获取当前文件的图片 xref，然后提取所有图片
     tlog(f"I({desc}): PhaseA pikepdf.open 开始")
     extracted = []  # list of (xref, pil_image, orig_raw_size, is_dct_cmyk)
     trivial_smask_xrefs = set()  # 记录需要移除的全透明 SMask 图片 xref
+    mixed_page_xrefs = set()
     try:
         with pikepdf.open(input_path) as pdf:
+            # 从缓存的页面索引构建当前文件的 mixed_page_xrefs
+            for page_idx in _mixed_page_indices_cache:
+                page = pdf.pages[page_idx]
+                resources = page.get("/Resources")
+                if resources is None:
+                    continue
+                xobjects = resources.get("/XObject")
+                if xobjects is None:
+                    continue
+                for name in xobjects:
+                    obj = xobjects[name]
+                    if not isinstance(obj, pikepdf.Stream):
+                        continue
+                    subtype = obj.get("/Subtype")
+                    if subtype == "/Image":
+                        mixed_page_xrefs.add(obj.objgen[0])
+                    elif subtype == "/Form":
+                        # Form XObject 可能嵌套图片
+                        fr = obj.get("/Resources")
+                        if fr is None:
+                            continue
+                        fx = fr.get("/XObject")
+                        if fx is None:
+                            continue
+                        for fn in fx:
+                            fo = fx[fn]
+                            if isinstance(fo, pikepdf.Stream) and fo.get("/Subtype") == "/Image":
+                                mixed_page_xrefs.add(fo.objgen[0])
+            tlog(f"I({desc}): mixed_page_xrefs={len(mixed_page_xrefs)} (从页面索引构建)")
+
             tlog(f"I({desc}): PhaseA pikepdf.open 完成, 遍历对象")
             for i, obj in enumerate(pdf.objects):
                 if isinstance(obj, pikepdf.Stream) and obj.get("/Subtype") == "/Image":
