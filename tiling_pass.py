@@ -271,11 +271,27 @@ def _compute_tile_grid(pil_img, target_rect, orig_stream_len, quality_db):
 # ============================
 def _compute_page_images(args):
     """Phase 2: 对一页的所有候选图做色彩检测 + 编码。返回修改列表。"""
-    page_idx, images_data, target_quality = args
+    page_idx, images_meta, target_quality, input_path = args
     modifications = []  # [(xref, redact_rect, [(tile_rect, stream_bytes)])]
     stats = {"mono": 0, "hybrid": 0}
 
-    for xref, pil_img, target_rect, orig_len, coverage, all_rects in images_data:
+    doc = fitz.open(input_path)
+    for xref, target_rect, orig_len, coverage, all_rects in images_meta:
+        try:
+            pix = fitz.Pixmap(doc, xref)
+            if pix.n >= 4:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            if pix.n == 1:
+                pil_img = Image.frombytes('L', [pix.width, pix.height], pix.samples).convert('RGB')
+            elif pix.n == 2:
+                pix_no_alpha = fitz.Pixmap(fitz.csGRAY, pix)
+                pil_img = Image.frombytes('L', [pix_no_alpha.width, pix_no_alpha.height], pix_no_alpha.samples).convert('RGB')
+            else:
+                pil_img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+            del pix
+        except Exception:
+            continue
+
         # 1. 严格灰度检测
         is_color = detect_strict_color(
             pil_img, grid_size=GRID_SIZE, threshold=COLOR_STD_THRESHOLD
@@ -318,6 +334,7 @@ def _compute_page_images(args):
                 stats["mono"] += tile_stats.get("mono", 0)
                 stats["hybrid"] += tile_stats.get("hybrid", 0)
 
+    doc.close()
     return page_idx, modifications, stats
 
 
@@ -387,19 +404,11 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
             target_rect = rects[0]
             coverage = sum(r.get_area() for r in rects) / page.rect.get_area()
 
-            pix = fitz.Pixmap(doc, xref)
-            if pix.n >= 4:
-                pix = fitz.Pixmap(fitz.csRGB, pix)
-            if pix.n == 1:
-                pil_img = Image.frombytes('L', [pix.width, pix.height], pix.samples).convert('RGB')
-            elif pix.n == 2:
-                pix_no_alpha = fitz.Pixmap(fitz.csGRAY, pix)
-                pil_img = Image.frombytes('L', [pix_no_alpha.width, pix_no_alpha.height], pix_no_alpha.samples).convert('RGB')
-            else:
-                pil_img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
-
-            orig_len = len(doc.xref_stream(xref))
-            page_images.append((xref, pil_img, target_rect, orig_len, coverage, list(rects)))
+            try:
+                orig_len = len(doc.xref_stream_raw(xref))
+            except Exception:
+                continue
+            page_images.append((xref, target_rect, orig_len, coverage, list(rects)))
 
         if page_images:
             candidates.append((page_idx, page_images))
@@ -430,8 +439,8 @@ def run_tiling_pass(input_path, output_path, target_quality, desc):
     )
 
     tasks = [
-        (page_idx, images_data, target_quality)
-        for page_idx, images_data in candidates
+        (page_idx, images_meta, target_quality, input_path)
+        for page_idx, images_meta in candidates
     ]
     # 释放候选列表引用 (images_data 已被 tasks 持有)
     candidates = None
