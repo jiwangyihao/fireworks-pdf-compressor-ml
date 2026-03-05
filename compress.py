@@ -236,37 +236,41 @@ def process_file(input_path, idx, total, unattended_mode=False):
         safe_print(f"      ║  检测到 {convert_count}/{total_pages_mono} 页单色装饰页面 (主色调: {dominant_hue})")
         safe_print(f"      ╠══════════════════════════════════════════════════════════════╣")
         safe_print(f"      ║  这些页面含有装饰色（如蓝色边框），但主体为灰度内容。")
-        safe_print(f"      ║  栅格化后可启用二值化压缩，显著减小文件体积。")
+        safe_print(f"      ║  灰度化后可启用二值化压缩，进一步减小文件体积。")
         safe_print(f"      ╠══════════════════════════════════════════════════════════════╣")
-        safe_print(f"      ║  [提醒] 请先确认这些页面是否确实适合灰度化：")
-        safe_print(f"      ║         - 若文件已是清晰灰度稿，通常不必再次灰度化")
-        safe_print(f"      ║         - 若需要保留专色/彩色信息，不建议强制灰度化")
-        safe_print(f"      ║         - 若文件含有矢量内容（如板写笔记、矢量绘图），不建议灰度化")
-        safe_print(f"      ║           灰度化会将矢量画面栅格化为位图，破坏矢量信息且无法还原")
-        safe_print(f"      ║  [建议] 若文档为双色套印、以白底黑字为主，且文件体积较大（如 >100MB）的书籍扫描件，")
-        safe_print(f"      ║         通常推荐灰度化以提升压缩收益。")
-        safe_print(f"      ║         如不确定，建议先选 [4] 不执行灰度化，并人工抽检后再决定。")
+        safe_print(f"      ║  如何选择：")
+        safe_print(f"      ║")
+        safe_print(f"      ║  · 文件模糊、文字灰暗不够黑 → 选 [1] ML增强")
+        safe_print(f"      ║  · 文件清晰/电子稿（文字可无限放大仍清晰）→ 选 [4]")
+        safe_print(f"      ║    矢量内容无需灰度化，交给后续矢量压缩即可")
+        safe_print(f"      ║  · 扫描件 + 正文纯黑白 → 选 [4]")
+        safe_print(f"      ║    已是黑白内容，不需要额外灰度化处理")
+        safe_print(f"      ║  · 扫描件 + 正文有彩色装饰（双色套印教材）→ 选 [3]")
+        safe_print(f"      ║    灰度化可去除装饰色，提升二值化压缩效果")
+        safe_print(f"      ║")
+        safe_print(f"      ║  [建议] 不确定时先选 [4]，它不会引入额外损失。")
+        safe_print(f"      ║         即使是双色套印，也可能在保留色彩的情况下压缩到目标大小。")
         safe_print(f"      ╠══════════════════════════════════════════════════════════════╣")
-        safe_print(f"      ║  增强方式选择:")
+        safe_print(f"      ║  选项说明：")
         safe_print(f"      ║")
         safe_print(f"      ║  [1] ML增强 (ESRGAN + NAF-DPM + DoxaPy)")
-        safe_print(f"      ║      - 效果最佳：文字锐利、背景纯净、消除扫描噪点")
+        safe_print(f"      ║      适用于模糊扫描件，文字锐化 + 背景净化 + 去噪")
         # 显示GPU加速状态
         if gpu_name != 'CPU':
-            safe_print(f"      ║      - GPU加速: {gpu_name} (大幅提升速度)")
+            safe_print(f"      ║      GPU加速: {gpu_name}")
         else:
-            safe_print(f"      ║      - 使用CPU推理 (较慢)")
-        safe_print(f"      ║      - 预计耗时: ~{estimated_ml_time} 分钟 ({convert_count}页 × ~{time_per_page_ml}分钟/页)")
+            safe_print(f"      ║      使用CPU推理 (较慢)")
+        safe_print(f"      ║      预计耗时: ~{estimated_ml_time} 分钟 ({convert_count}页 × ~{time_per_page_ml}分钟/页)")
         safe_print(f"      ║")
         safe_print(f"      ║  [2] 传统增强 (降噪 + CLAHE + 锐化)")
-        safe_print(f"      ║      - 效果一般：基础去噪和对比度调整")
-        safe_print(f"      ║      - 预计耗时: ~{estimated_traditional_time:.1f} 分钟")
+        safe_print(f"      ║      基础去噪和对比度调整")
+        safe_print(f"      ║      预计耗时: ~{estimated_traditional_time:.1f} 分钟")
         safe_print(f"      ║")
-        safe_print(f"      ║  [3] 执行灰度化但跳过增强")
-        safe_print(f"      ║      - 仅栅格化为灰度，不做任何增强处理")
+        safe_print(f"      ║  [3] 仅灰度化，不做增强")
+        safe_print(f"      ║      栅格化为灰度图，适合双色套印教材")
         safe_print(f"      ║")
-        safe_print(f"      ║  [4] 不执行灰度化 (推荐用于不确定场景)")
-        safe_print(f"      ║      - 保持原页面色彩结构，不进行栅格化")
+        safe_print(f"      ║  [4] 不执行灰度化 (推荐)")
+        safe_print(f"      ║      保持原页面结构，不引入额外损失")
         safe_print(f"      ╚══════════════════════════════════════════════════════════════╝")
         
         # 用户交互 / 无人值守默认策略
@@ -274,7 +278,7 @@ def process_file(input_path, idx, total, unattended_mode=False):
             safe_print("      [AUTO] 无人值守模式：默认不执行灰度化，请后续人工抽检文件实际状态。")
         else:
             try:
-                user_input = input("      --> 请选择 [1/2/3/4]，直接回车默认选择 2 (传统增强): ").strip()
+                user_input = input("      --> 请选择 [1/2/3/4]，直接回车默认选择 4 (不灰度化): ").strip()
 
                 if user_input == '1':
                     safe_print(f"      [ML] 使用ML增强管线处理 {convert_count} 页...")
@@ -285,16 +289,7 @@ def process_file(input_path, idx, total, unattended_mode=False):
                         safe_print(f"      [OK] ML增强完成: {get_file_mb(current_file):.2f} MB")
                     else:
                         safe_print("      [WARN] ML增强过程出错。")
-                elif user_input == '3':
-                    safe_print(f"      [SKIP] 跳过增强，仅栅格化...")
-                    if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=False):
-                        if current_file != input_path:
-                            safe_remove(current_file)
-                        current_file = tmp_gray
-                        safe_print(f"      [OK] 栅格化完成: {get_file_mb(current_file):.2f} MB")
-                elif user_input == '4':
-                    safe_print("      [SKIP] 按用户选择跳过灰度化，请人工核验页面真实色彩属性。")
-                else:  # 默认选择 2
+                elif user_input == '2':
                     safe_print(f"      [传统] 使用传统增强处理 {convert_count} 页...")
                     if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=True, use_ml=False):
                         if current_file != input_path:
@@ -303,6 +298,15 @@ def process_file(input_path, idx, total, unattended_mode=False):
                         safe_print(f"      [OK] 传统增强完成: {get_file_mb(current_file):.2f} MB")
                     else:
                         safe_print("      [WARN] 传统增强过程出错。")
+                elif user_input == '3':
+                    safe_print(f"      [灰度] 仅灰度化处理 {convert_count} 页...")
+                    if convert_pages_to_grayscale(current_file, tmp_gray, pages_to_convert, enhance=False):
+                        if current_file != input_path:
+                            safe_remove(current_file)
+                        current_file = tmp_gray
+                        safe_print(f"      [OK] 灰度化完成: {get_file_mb(current_file):.2f} MB")
+                else:  # 默认选择 4
+                    safe_print("      [SKIP] 跳过灰度化，保持原页面结构。")
             except EOFError:
                 # 非交互模式，默认不执行灰度化
                 safe_print("      [AUTO] 非交互模式：默认不执行灰度化，请人工核验页面真实色彩属性。")
