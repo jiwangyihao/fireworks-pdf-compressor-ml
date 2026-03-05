@@ -21,6 +21,12 @@ from tiling_pass import detect_strict_color, detect_mono_or_hybrid, set_pure_ima
 _mixed_page_indices_cache = None  # None=未扫描, set()=已扫描
 
 
+def invalidate_image_pass_cache():
+    """文件间重置页面索引缓存，防止跨文件污染。"""
+    global _mixed_page_indices_cache
+    _mixed_page_indices_cache = None
+
+
 # ============================
 # 图像大小估算 & 页级/流级回退守卫
 # ============================

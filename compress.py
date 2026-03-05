@@ -16,11 +16,12 @@ from config import (
 )
 from utils import safe_print, safe_remove, get_file_mb, is_valid_pdf, _recompress_streams_libdeflate
 from gs_pass import surgical_clean, run_gs_level0, rollback_worse_content_streams
-from vector_pass import run_regex_pass, run_shape_pass
-from tiling_pass import run_tiling_pass
+from vector_pass import run_regex_pass, run_shape_pass, invalidate_stream_cache
+from tiling_pass import run_tiling_pass, invalidate_tiling_pass_cache
 from image_pass import (
     rollback_worse_pages_by_image_payload,
     run_image_pass_safe,
+    invalidate_image_pass_cache,
 )
 from grayscale import (
     detect_mono_decorative_pages, convert_pages_to_grayscale,
@@ -33,6 +34,11 @@ large_file_report_list = []
 
 
 def process_file(input_path, idx, total, unattended_mode=False):
+    # 重置跨文件缓存，防止批处理/无人值守模式下缓存污染
+    invalidate_stream_cache()
+    invalidate_tiling_pass_cache()
+    invalidate_image_pass_cache()
+
     file_mb = get_file_mb(input_path)
     initially_under_threshold = file_mb < SIZE_THRESHOLD_MB
     base_name = os.path.basename(input_path)

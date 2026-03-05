@@ -27,6 +27,12 @@ def set_pure_image_pages_cache(pages_set):
     _pure_image_pages_cache = pages_set
 
 
+def invalidate_tiling_pass_cache():
+    """文件间重置纯图片页缓存，防止跨文件污染。"""
+    global _pure_image_pages_cache
+    _pure_image_pages_cache = None
+
+
 # ============================
 # 灰度/色彩 严格检测逻辑
 # ============================
